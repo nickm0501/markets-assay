@@ -1,0 +1,7 @@
+interface:
+  display_name: "Design in Practice"
+  short_description: "Facilitate serious technical design decisions"
+  default_prompt: "Use $design-in-practice to facilitate a technical design decision."
+
+policy:
+  allow_implicit_invocation: false
