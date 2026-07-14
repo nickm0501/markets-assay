@@ -88,3 +88,72 @@ fn fixture_command_writes_dataset_snapshot() {
     assert!(dataset_dir.join("source_catalog.parquet").exists());
     assert!(dataset_dir.join("manifest.json").exists());
 }
+
+#[test]
+fn build_observations_reuses_dataset_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    let output = cmd
+        .args([
+            "build-observations",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+            "--dataset-id",
+            &dataset_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("observation_set_id=obs_"))
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let observation_set_id = stdout.trim().strip_prefix("observation_set_id=").unwrap();
+    let observation_dir = temp
+        .path()
+        .join("data")
+        .join("observation_sets")
+        .join(observation_set_id);
+
+    assert!(
+        observation_dir
+            .join("news_signal_observations.parquet")
+            .exists()
+    );
+    assert!(observation_dir.join("manifest.json").exists());
+    assert!(
+        temp.path()
+            .join("data")
+            .join("datasets")
+            .join(dataset_id)
+            .join("manifest.json")
+            .exists()
+    );
+}
+
+fn run_fixture_and_extract_dataset_id(root: &std::path::Path) -> String {
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    let output = cmd
+        .args([
+            "fixture",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            root.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output)
+        .unwrap()
+        .trim()
+        .strip_prefix("dataset_id=")
+        .unwrap()
+        .to_string()
+}

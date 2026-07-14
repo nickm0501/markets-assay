@@ -5,6 +5,7 @@ pub mod domain;
 pub mod fixture;
 pub mod ids;
 pub mod normalize;
+pub mod observations;
 pub mod pipeline;
 pub mod sentiment;
 pub mod storage;

@@ -79,7 +79,15 @@ pub fn run_cli() -> Result<()> {
     match cli.command {
         Commands::Run(args) => run_loaded_config(args.stage, pipeline::run_fixture),
         Commands::Fixture(args) => run_loaded_config(args, pipeline::run_fixture),
-        Commands::BuildObservations(args) => print_loaded_config(args.stage, "build-observations"),
+        Commands::BuildObservations(args) => {
+            let config = Stage0Config::load(&args.stage.config)?;
+            pipeline::run_build_observations(
+                &config,
+                args.stage.output_root,
+                args.stage.dry_run,
+                &args.dataset_id,
+            )
+        }
         Commands::Analyze(args) => print_loaded_config(args.stage, "analyze"),
         Commands::Backtest(args) => print_loaded_config(args.observation.stage, "backtest"),
     }
