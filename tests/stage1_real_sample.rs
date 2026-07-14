@@ -9,7 +9,7 @@
 //! wired together correctly rather than merely passing its own unit tests.
 
 use markets::{
-    backtest::run_backtests_by_configuration,
+    backtest::{BacktestParams, run_backtests_by_configuration},
     config::PipelineConfig,
     normalize::normalize_articles,
     observations::build_observations,
@@ -123,11 +123,14 @@ fn trace_one_real_article_from_vendor_json_through_to_its_trade() {
     let results = run_backtests_by_configuration(
         "trace",
         &observations,
-        config.long_quantile,
-        config.short_quantile,
-        10.0,
-        config.max_modal_share,
-        config.seed,
+        BacktestParams {
+            long_quantile: config.long_quantile,
+            short_quantile: config.short_quantile,
+            cost_bps: 10.0,
+            max_modal_share: config.max_modal_share,
+            seed: config.seed,
+            development_fraction: config.development_fraction,
+        },
     );
     // Every configuration now emits five results (sentiment + four baselines),
     // so the trade must be pinned to the SENTIMENT strategy — otherwise this

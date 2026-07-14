@@ -29,6 +29,10 @@ fn default_seed() -> u64 {
     42
 }
 
+fn default_development_fraction() -> f64 {
+    0.5
+}
+
 /// Thresholds for the spec's 5-value decision vocabulary.
 ///
 /// Every one lives in config rather than in the verdict function. Stage 3 will
@@ -128,6 +132,13 @@ pub struct PipelineConfig {
     /// baseline — it is an anecdote.
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Share of observations (chronologically) used as the DEVELOPMENT set.
+    ///
+    /// The spec: "The first year is used for exploration... The second year is the
+    /// final untouched holdout. Quantile thresholds are learned from development
+    /// data and then frozen." 0.5 = the spec's one-year/one-year split.
+    #[serde(default = "default_development_fraction")]
+    pub development_fraction: f64,
     pub costs_bps: Vec<f64>,
     pub holidays: Vec<NaiveDate>,
     pub early_closes: BTreeMap<NaiveDate, String>,

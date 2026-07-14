@@ -34,6 +34,8 @@ pub struct Trade {
     /// Every strategy runs through the same engine on the same observations, so
     /// their trade logs are directly comparable.
     pub strategy: String,
+    /// `development` (thresholds fitted here) or `holdout` (thresholds frozen).
+    pub split: String,
     pub side: String,
     pub signal_time: DateTime<Utc>,
     pub entry_time: DateTime<Utc>,
@@ -60,6 +62,10 @@ pub struct BacktestMetrics {
     /// "stop or revise when sentiment performs no better than shuffled or
     /// non-sentiment baselines".
     pub strategy: String,
+    /// `development` | `holdout`. Quantile thresholds are learned on development
+    /// and FROZEN for the holdout — the spec's validation design, and the fix for
+    /// a lookahead bug the no-lookahead check could not see.
+    pub split: String,
     pub cost_bps: f64,
     pub trade_count: u32,
     pub long_count: u32,

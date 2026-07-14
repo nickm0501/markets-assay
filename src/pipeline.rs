@@ -1,7 +1,7 @@
 use crate::{
     analysis::{AnalysisContext, analyze_observations, bucket_return_rows, coverage_rows},
     audit::{assert_no_lookahead, timestamp_audit_rows},
-    backtest::{run_backtests_by_configuration, strategy_comparison},
+    backtest::{BacktestParams, run_backtests_by_configuration, strategy_comparison},
     config::PipelineConfig,
     domain::{
         article::{Disposition, NormalizedArticle, SetAsideArticle},
@@ -172,11 +172,14 @@ fn build_analysis_context(
     let all_strategies = run_backtests_by_configuration(
         &config.run_id,
         observations,
-        config.long_quantile,
-        config.short_quantile,
-        cost_bps,
-        config.max_modal_share,
-        config.seed,
+        BacktestParams {
+            long_quantile: config.long_quantile,
+            short_quantile: config.short_quantile,
+            cost_bps,
+            max_modal_share: config.max_modal_share,
+            seed: config.seed,
+            development_fraction: config.development_fraction,
+        },
     );
     let strategy_nets = strategy_comparison(&all_strategies);
 
@@ -241,6 +244,7 @@ fn build_analysis_context(
         short_quantile: config.short_quantile,
         max_modal_share: config.max_modal_share,
         seed: config.seed,
+        development_fraction: config.development_fraction,
         thresholds: config.verdict_thresholds.clone(),
     })
 }
@@ -543,11 +547,14 @@ pub fn run_backtest_command(
     let results = run_backtests_by_configuration(
         run_id,
         &observations,
-        config.long_quantile,
-        config.short_quantile,
-        cost_bps,
-        config.max_modal_share,
-        config.seed,
+        BacktestParams {
+            long_quantile: config.long_quantile,
+            short_quantile: config.short_quantile,
+            cost_bps,
+            max_modal_share: config.max_modal_share,
+            seed: config.seed,
+            development_fraction: config.development_fraction,
+        },
     );
     let total_trades: usize = results.iter().map(|result| result.trades.len()).sum();
     if dry_run {
@@ -631,11 +638,14 @@ pub fn run_all(
     let backtests = run_backtests_by_configuration(
         run_id,
         &observations,
-        config.long_quantile,
-        config.short_quantile,
-        cost_bps,
-        config.max_modal_share,
-        config.seed,
+        BacktestParams {
+            long_quantile: config.long_quantile,
+            short_quantile: config.short_quantile,
+            cost_bps,
+            max_modal_share: config.max_modal_share,
+            seed: config.seed,
+            development_fraction: config.development_fraction,
+        },
     );
     let metrics: Vec<_> = backtests
         .iter()

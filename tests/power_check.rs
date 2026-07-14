@@ -7,7 +7,7 @@
 
 use markets::{
     analysis::{AnalysisContext, analyze_observations},
-    backtest::{run_backtests_by_configuration, strategy_comparison},
+    backtest::{BacktestParams, run_backtests_by_configuration, strategy_comparison},
     config::VerdictThresholds,
     domain::observation::NewsSignalObservation,
 };
@@ -84,7 +84,18 @@ fn planted_signal(n: usize, strength: f64) -> Vec<NewsSignalObservation> {
 }
 
 fn context_for(observations: &[NewsSignalObservation]) -> AnalysisContext {
-    let results = run_backtests_by_configuration("power", observations, 0.8, 0.2, 5.0, 0.8, 42);
+    let results = run_backtests_by_configuration(
+        "power",
+        observations,
+        BacktestParams {
+            long_quantile: 0.8,
+            short_quantile: 0.2,
+            cost_bps: 5.0,
+            max_modal_share: 0.8,
+            seed: 42,
+            development_fraction: 0.5,
+        },
+    );
     AnalysisContext {
         quarantine_rate: 0.0,
         lexicon_hit_rate: 0.9,
@@ -100,6 +111,7 @@ fn context_for(observations: &[NewsSignalObservation]) -> AnalysisContext {
         short_quantile: 0.2,
         max_modal_share: 0.8,
         seed: 42,
+        development_fraction: 0.5,
         thresholds: VerdictThresholds::default(),
     }
 }

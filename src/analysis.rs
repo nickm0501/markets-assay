@@ -62,6 +62,7 @@ pub struct AnalysisContext {
     pub short_quantile: f64,
     pub max_modal_share: f64,
     pub seed: u64,
+    pub development_fraction: f64,
     pub thresholds: VerdictThresholds,
     /// Per configuration: (sentiment net return, best baseline net return, its
     /// name). Computed by running all five strategies through the same backtest
@@ -171,11 +172,22 @@ pub fn analyze_observations(
     configuration_groups(observations)
         .into_iter()
         .map(|(key, group)| {
-            // Observed and null must share the same bucketing (top_minus_bottom) so the
-            // continue/revise verdict isolates the sentiment ordering, not a difference
-            // in how the two spreads carve up the group.
-            let observed = top_minus_bottom(&sentiment_return_pairs(&group));
-            let (shuffled, shuffled_p95) = shuffled_spread(&group, context.seed);
+            // THE SPREAD IS MEASURED ON THE HOLDOUT.
+            //
+            // The spec's success gate is explicit: "the HELD-OUT top-minus-bottom
+            // sentiment return spread is positive". Measuring it across the whole
+            // sample means measuring it partly on the data the thresholds were
+            // fitted to — marking your own homework.
+            //
+            // Both observed and null share the same bucketing, so the verdict
+            // isolates the sentiment ORDERING rather than a difference in how the
+            // two spreads carve up the group.
+            let (_development, holdout) =
+                crate::backtest::split_chronologically(&group, context.development_fraction);
+            let judged: &[&NewsSignalObservation] =
+                if holdout.len() >= 3 { &holdout } else { &group };
+            let observed = top_minus_bottom(&sentiment_return_pairs(judged));
+            let (shuffled, shuffled_p95) = shuffled_spread(judged, context.seed);
 
             let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
             let degenerate = is_degenerate(
@@ -232,7 +244,7 @@ pub fn analyze_observations(
                 observed_top_minus_bottom: observed,
                 shuffled_top_minus_bottom: shuffled,
                 shuffled_p95,
-                observation_count: group.len() as u32,
+                observation_count: judged.len() as u32,
                 sentiment_net_return: sentiment_net,
                 best_baseline_net_return: best_baseline_net,
                 best_baseline_name,
@@ -414,6 +426,10 @@ mod tests {
             article_sources: BTreeMap::new(),
             strategy_nets: BTreeMap::new(),
             seed: 42,
+            // 0.0 = no development split, so the spread is measured over the whole
+            // group. These tests are about the SPREAD MATH, not the split; the
+            // split has its own test (tests/no_threshold_lookahead.rs).
+            development_fraction: 0.0,
             long_quantile: 0.8,
             short_quantile: 0.2,
             max_modal_share: 1.0,

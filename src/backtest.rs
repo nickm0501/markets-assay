@@ -64,6 +64,57 @@ impl Strategy {
     }
 }
 
+/// Which half of the chronological split a result belongs to.
+///
+/// The spec: *"Parameter selection uses only the development year. **Quantile
+/// thresholds are learned from development data and then frozen.** The holdout is
+/// evaluated once for the primary result."*
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Split {
+    /// The first chronological portion. Thresholds are learned here.
+    Development,
+    /// The remainder. Thresholds are FROZEN — nothing about this data may
+    /// influence how it is traded.
+    Holdout,
+}
+
+impl Split {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Split::Development => "development",
+            Split::Holdout => "holdout",
+        }
+    }
+}
+
+/// Split observations chronologically by `signal_time`.
+///
+/// **This closes a lookahead bug that the pipeline's own no-lookahead check was
+/// blind to.** `quantile(signals, 0.8)` used to be computed across the ENTIRE
+/// observation set, so a trade on day 1 used a threshold derived from sentiment
+/// scores on day 7. Information from the future decided whether you went long
+/// today.
+///
+/// `assert_no_lookahead` could never catch it: that verifies `available_at <=
+/// entry_time` for every ARTICLE, and every article was clean. The leak was not in
+/// the articles, it was in the THRESHOLD. On a 5-day sample it barely matters. On
+/// two years it would inflate every result, quietly, while the leakage check
+/// reported green.
+pub fn split_chronologically<'a>(
+    observations: &[&'a NewsSignalObservation],
+    development_fraction: f64,
+) -> (
+    Vec<&'a NewsSignalObservation>,
+    Vec<&'a NewsSignalObservation>,
+) {
+    let mut sorted: Vec<&NewsSignalObservation> = observations.to_vec();
+    sorted.sort_by_key(|row| (row.signal_time, row.observation_id.clone()));
+    let cut = ((sorted.len() as f64) * development_fraction).round() as usize;
+    let cut = cut.min(sorted.len());
+    let holdout = sorted.split_off(cut);
+    (sorted, holdout)
+}
+
 /// SplitMix64. A tiny, deterministic PRNG so the random baseline is reproducible
 /// from `(seed, observation_id)` alone — the spec's Required Tests demand
 /// "determinism for identical snapshot, configuration, and seed", and a baseline
@@ -126,15 +177,47 @@ fn signals_for(
 /// Quantile thresholds and the overlap-skip trade-slot logic stay scoped to one
 /// configuration — pooling them lets unrelated configurations compete for the
 /// same trade.
+/// Everything the backtest needs that is not the data itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BacktestParams {
+    pub long_quantile: f64,
+    pub short_quantile: f64,
+    pub cost_bps: f64,
+    pub max_modal_share: f64,
+    pub seed: u64,
+    /// Share of observations (chronologically) used to FIT the thresholds. The
+    /// rest is held out, and the thresholds are frozen before it is touched.
+    pub development_fraction: f64,
+}
+
+impl BacktestParams {
+    /// Test helper: standard quantiles, no holdout. Use when the subject is trade
+    /// MECHANICS rather than the split.
+    pub fn unsplit(cost_bps: f64, seed: u64) -> Self {
+        Self {
+            long_quantile: 0.8,
+            short_quantile: 0.2,
+            cost_bps,
+            max_modal_share: 0.8,
+            seed,
+            development_fraction: 1.0,
+        }
+    }
+}
+
 pub fn run_backtests_by_configuration(
     run_id: &str,
     observations: &[NewsSignalObservation],
-    long_quantile: f64,
-    short_quantile: f64,
-    cost_bps: f64,
-    max_modal_share: f64,
-    seed: u64,
+    params: BacktestParams,
 ) -> Vec<BacktestResult> {
+    let BacktestParams {
+        long_quantile,
+        short_quantile,
+        cost_bps,
+        max_modal_share,
+        seed,
+        development_fraction,
+    } = params;
     let mut groups: BTreeMap<(i64, i64, String), Vec<&NewsSignalObservation>> = BTreeMap::new();
     for row in observations {
         groups
@@ -149,7 +232,7 @@ pub fn run_backtests_by_configuration(
     groups
         .iter()
         .flat_map(|(key, group)| {
-            Strategy::ALL.iter().map(move |strategy| {
+            Strategy::ALL.iter().flat_map(move |strategy| {
                 run_backtest_for_configuration(
                     run_id,
                     key,
@@ -160,6 +243,7 @@ pub fn run_backtests_by_configuration(
                     cost_bps,
                     max_modal_share,
                     seed,
+                    development_fraction,
                 )
             })
         })
@@ -168,11 +252,21 @@ pub fn run_backtests_by_configuration(
 
 /// The sentiment result for each configuration, and the best baseline it must
 /// beat. This is what turns the baselines from decoration into a gate.
+/// Sentiment vs its best baseline, **on the HOLDOUT**.
+///
+/// The spec's success gates are explicitly about held-out performance ("the
+/// held-out top-minus-bottom sentiment return spread is positive", "the held-out
+/// long/short strategy is profitable after moderate costs"). Development results
+/// are where thresholds were fitted; judging on them would be marking your own
+/// homework.
 pub fn strategy_comparison(
     results: &[BacktestResult],
 ) -> BTreeMap<(i64, i64, String), (f64, f64, String)> {
     let mut by_configuration: BTreeMap<(i64, i64, String), (f64, f64, String)> = BTreeMap::new();
-    for result in results {
+    for result in results
+        .iter()
+        .filter(|r| r.metrics.split == Split::Holdout.as_str())
+    {
         let key = (
             result.metrics.news_window_minutes,
             result.metrics.measurement_horizon_minutes,
@@ -239,84 +333,111 @@ fn run_backtest_for_configuration(
     cost_bps: f64,
     max_modal_share: f64,
     seed: u64,
-) -> BacktestResult {
+    development_fraction: f64,
+) -> Vec<BacktestResult> {
     // Always-flat takes no trades by definition. It is the floor: if sentiment
-    // cannot beat DOING NOTHING after costs, there is no edge. Costs are what
-    // make that a real bar rather than a trivial one.
-    let Some(signals) = signals_for(strategy, observations, seed) else {
-        return BacktestResult {
-            metrics: metrics(run_id, key, cost_bps, strategy, &[]),
-            trades: Vec::new(),
-        };
+    // cannot beat DOING NOTHING after costs, there is no edge.
+    let Some(all_signals) = signals_for(strategy, observations, seed) else {
+        return vec![
+            BacktestResult {
+                metrics: metrics(run_id, key, cost_bps, strategy, Split::Development, &[]),
+                trades: Vec::new(),
+            },
+            BacktestResult {
+                metrics: metrics(run_id, key, cost_bps, strategy, Split::Holdout, &[]),
+                trades: Vec::new(),
+            },
+        ];
     };
 
-    let long_threshold = quantile(signals.clone(), long_quantile);
-    let short_threshold = quantile(signals.clone(), short_quantile);
-
-    if is_degenerate(&signals, long_threshold, short_threshold, max_modal_share) {
-        // Zero trades, flagged. NOT an all-long book, and not a silent zero
-        // either — a caller must be able to tell "we declined to trade this"
-        // from "we traded it and made nothing".
-        let mut metrics = metrics(run_id, key, cost_bps, strategy, &[]);
-        metrics.degenerate = true;
-        return BacktestResult {
-            metrics,
-            trades: Vec::new(),
-        };
-    }
-
-    // Sort by entry, carrying each row's signal with it, so every strategy meets
-    // identical trade-slot logic. The comparison is only evidence if it is fair.
-    let mut sorted: Vec<(&NewsSignalObservation, f64)> = observations
+    // Pair each observation with its signal, then split CHRONOLOGICALLY.
+    let mut paired: Vec<(&NewsSignalObservation, f64)> = observations
         .iter()
         .copied()
-        .zip(signals.iter().copied())
+        .zip(all_signals.iter().copied())
         .collect();
-    sorted.sort_by_key(|(row, _)| (row.entry_time, row.symbol.clone()));
+    paired.sort_by_key(|(row, _)| (row.signal_time, row.observation_id.clone()));
+    let cut = (((paired.len() as f64) * development_fraction).round() as usize).min(paired.len());
+    let holdout_pairs = paired.split_off(cut);
+    let development_pairs = paired;
 
-    let mut last_exit_by_symbol = BTreeMap::<String, chrono::DateTime<chrono::Utc>>::new();
-    let mut trades = Vec::new();
-    for (row, signal) in sorted {
-        if last_exit_by_symbol
-            .get(&row.symbol)
-            .is_some_and(|last_exit| row.entry_time < *last_exit)
-        {
-            continue;
+    // THRESHOLDS ARE LEARNED FROM DEVELOPMENT DATA ONLY, THEN FROZEN.
+    //
+    // This is the whole point. Computing them over every observation meant a trade
+    // on day 1 used a threshold derived from day 7's sentiment — lookahead that
+    // `assert_no_lookahead` cannot see, because the leak is in the threshold, not
+    // in any article.
+    let development_signals: Vec<f64> = development_pairs.iter().map(|(_, s)| *s).collect();
+    let long_threshold = quantile(development_signals.clone(), long_quantile);
+    let short_threshold = quantile(development_signals.clone(), short_quantile);
+    let degenerate = is_degenerate(
+        &development_signals,
+        long_threshold,
+        short_threshold,
+        max_modal_share,
+    );
+
+    let run_split = |split: Split, pairs: &[(&NewsSignalObservation, f64)]| -> BacktestResult {
+        if degenerate {
+            let mut m = metrics(run_id, key, cost_bps, strategy, split, &[]);
+            m.degenerate = true;
+            return BacktestResult {
+                metrics: m,
+                trades: Vec::new(),
+            };
         }
-        let side = if signal >= long_threshold {
-            "long"
-        } else if signal <= short_threshold {
-            "short"
-        } else {
-            continue;
-        };
-        let gross_return = if side == "long" {
-            row.future_return
-        } else {
-            -row.future_return
-        };
-        let net_return = gross_return - cost_bps / 10_000.0;
-        last_exit_by_symbol.insert(row.symbol.clone(), row.exit_time);
-        trades.push(Trade {
-            run_id: run_id.into(),
-            observation_id: row.observation_id.clone(),
-            symbol: row.symbol.clone(),
-            news_window_minutes: key.0,
-            measurement_horizon_minutes: key.1,
-            source_set: key.2.clone(),
-            strategy: strategy.as_str().into(),
-            side: side.into(),
-            signal_time: row.signal_time,
-            entry_time: row.entry_time,
-            exit_time: row.exit_time,
-            sentiment: signal,
-            gross_return,
-            cost_bps,
-            net_return,
-        });
-    }
-    let metrics = metrics(run_id, key, cost_bps, strategy, &trades);
-    BacktestResult { metrics, trades }
+        let mut last_exit_by_symbol = BTreeMap::<String, chrono::DateTime<chrono::Utc>>::new();
+        let mut sorted: Vec<(&NewsSignalObservation, f64)> = pairs.to_vec();
+        sorted.sort_by_key(|(row, _)| (row.entry_time, row.symbol.clone()));
+        let mut trades = Vec::new();
+        for (row, signal) in sorted {
+            if last_exit_by_symbol
+                .get(&row.symbol)
+                .is_some_and(|last_exit| row.entry_time < *last_exit)
+            {
+                continue;
+            }
+            let side = if signal >= long_threshold {
+                "long"
+            } else if signal <= short_threshold {
+                "short"
+            } else {
+                continue;
+            };
+            let gross_return = if side == "long" {
+                row.future_return
+            } else {
+                -row.future_return
+            };
+            let net_return = gross_return - cost_bps / 10_000.0;
+            last_exit_by_symbol.insert(row.symbol.clone(), row.exit_time);
+            trades.push(Trade {
+                run_id: run_id.into(),
+                observation_id: row.observation_id.clone(),
+                symbol: row.symbol.clone(),
+                news_window_minutes: key.0,
+                measurement_horizon_minutes: key.1,
+                source_set: key.2.clone(),
+                strategy: strategy.as_str().into(),
+                split: split.as_str().into(),
+                side: side.into(),
+                signal_time: row.signal_time,
+                entry_time: row.entry_time,
+                exit_time: row.exit_time,
+                sentiment: signal,
+                gross_return,
+                cost_bps,
+                net_return,
+            });
+        }
+        let metrics = metrics(run_id, key, cost_bps, strategy, split, &trades);
+        BacktestResult { metrics, trades }
+    };
+
+    vec![
+        run_split(Split::Development, &development_pairs),
+        run_split(Split::Holdout, &holdout_pairs),
+    ]
 }
 
 fn quantile(mut values: Vec<f64>, q: f64) -> f64 {
@@ -333,6 +454,7 @@ fn metrics(
     key: &(i64, i64, String),
     cost_bps: f64,
     strategy: Strategy,
+    split: Split,
     trades: &[Trade],
 ) -> BacktestMetrics {
     let gross_return_sum: f64 = trades.iter().map(|trade| trade.gross_return).sum();
@@ -358,6 +480,7 @@ fn metrics(
         measurement_horizon_minutes: key.1,
         source_set: key.2.clone(),
         strategy: strategy.as_str().into(),
+        split: split.as_str().into(),
         cost_bps,
         trade_count: trades.len() as u32,
         long_count: trades.iter().filter(|trade| trade.side == "long").count() as u32,
@@ -454,9 +577,12 @@ mod tests {
         build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap()
     }
 
-    /// The SENTIMENT result for one configuration. Every configuration now emits
-    /// five results (sentiment + four baselines), so a test that just takes the
-    /// first match would silently assert against a baseline.
+    /// The SENTIMENT / DEVELOPMENT result for one configuration.
+    ///
+    /// Every configuration now emits ten results: five strategies x two splits.
+    /// A test that just takes the first match would silently assert against a
+    /// baseline, or against the holdout. These tests are about the trading
+    /// mechanics, which are exercised on the split where thresholds were fitted.
     fn finance_only_hour_hour_result(results: &[BacktestResult]) -> &BacktestResult {
         results
             .iter()
@@ -465,6 +591,7 @@ mod tests {
                     && result.metrics.measurement_horizon_minutes == 60
                     && result.metrics.source_set == "finance_only"
                     && result.metrics.strategy == Strategy::Sentiment.as_str()
+                    && result.metrics.split == Split::Development.as_str()
             })
             .unwrap()
     }
@@ -533,10 +660,24 @@ mod tests {
             .collect();
         group.push(observation_with_sentiment(0.5, 0.02));
 
-        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &group,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let sentiment = results
             .iter()
-            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .find(|r| {
+                r.metrics.strategy == Strategy::Sentiment.as_str()
+                    && r.metrics.split == Split::Development.as_str()
+            })
             .unwrap();
 
         assert!(
@@ -600,10 +741,24 @@ mod tests {
             .map(|i| observation_with_sentiment(i as f64 / 10.0, 0.01 * i as f64))
             .collect();
 
-        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &group,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let sentiment = results
             .iter()
-            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .find(|r| {
+                r.metrics.strategy == Strategy::Sentiment.as_str()
+                    && r.metrics.split == Split::Development.as_str()
+            })
             .unwrap();
 
         assert!(!sentiment.metrics.degenerate);
@@ -623,8 +778,18 @@ mod tests {
         // The floor, and NOT a trivial one: always-flat pays no costs. A strategy
         // that trades 200 times to earn less than doing nothing has discovered a
         // way to pay commissions.
-        let results =
-            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &observations(),
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let flat: Vec<&BacktestResult> = results
             .iter()
             .filter(|r| r.metrics.strategy == Strategy::AlwaysFlat.as_str())
@@ -643,8 +808,30 @@ mod tests {
         // The spec's Required Tests demand "determinism for identical snapshot,
         // configuration, and seed". A baseline nobody can reproduce is not a
         // baseline, it is an anecdote.
-        let first = run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 7);
-        let second = run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 7);
+        let first = run_backtests_by_configuration(
+            "run",
+            &observations(),
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 7,
+                development_fraction: 0.5,
+            },
+        );
+        let second = run_backtests_by_configuration(
+            "run",
+            &observations(),
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 7,
+                development_fraction: 0.5,
+            },
+        );
 
         assert_eq!(first, second);
     }
@@ -654,11 +841,22 @@ mod tests {
         // Otherwise the seed is decorative and the "random" baseline is a fixed
         // pattern wearing a costume.
         let net = |seed: u64| -> f64 {
-            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, seed)
-                .iter()
-                .filter(|r| r.metrics.strategy == Strategy::Random.as_str())
-                .map(|r| r.metrics.net_return_sum)
-                .sum()
+            run_backtests_by_configuration(
+                "run",
+                &observations(),
+                BacktestParams {
+                    long_quantile: 0.8,
+                    short_quantile: 0.2,
+                    cost_bps: 5.0,
+                    max_modal_share: 0.8,
+                    seed,
+                    development_fraction: 0.5,
+                },
+            )
+            .iter()
+            .filter(|r| r.metrics.strategy == Strategy::Random.as_str())
+            .map(|r| r.metrics.net_return_sum)
+            .sum()
         };
 
         assert_ne!(net(7), net(9999));
@@ -680,14 +878,31 @@ mod tests {
             })
             .collect();
 
-        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &group,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let momentum = results
             .iter()
-            .find(|r| r.metrics.strategy == Strategy::PriorReturnMomentum.as_str())
+            .find(|r| {
+                r.metrics.strategy == Strategy::PriorReturnMomentum.as_str()
+                    && r.metrics.split == Split::Development.as_str()
+            })
             .unwrap();
         let sentiment = results
             .iter()
-            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .find(|r| {
+                r.metrics.strategy == Strategy::Sentiment.as_str()
+                    && r.metrics.split == Split::Development.as_str()
+            })
             .unwrap();
 
         // Sentiment is all ties -> degenerate -> no trades. Momentum has a real
@@ -704,11 +919,22 @@ mod tests {
         // An unfair comparison is worse than no comparison, because it looks like
         // evidence. Every strategy must meet the same observations, the same
         // costs, and the same trade-slot logic — only the SIGNAL differs.
-        let results =
-            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &observations(),
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let configurations = crate::analysis::configuration_groups(&observations()).len();
 
-        assert_eq!(results.len(), configurations * Strategy::ALL.len());
+        // five strategies x two splits (development + holdout)
+        assert_eq!(results.len(), configurations * Strategy::ALL.len() * 2);
         for result in &results {
             assert_eq!(result.metrics.cost_bps, 5.0);
         }
@@ -719,8 +945,8 @@ mod tests {
                     .iter()
                     .filter(|r| r.metrics.strategy == strategy.as_str())
                     .count(),
-                configurations,
-                "{} is missing from some configuration",
+                configurations * 2,
+                "{} is missing from some configuration or split",
                 strategy.as_str()
             );
         }
@@ -730,8 +956,18 @@ mod tests {
     fn strategy_comparison_reports_sentiment_against_its_strongest_baseline() {
         // Not against the weakest, and not against the average. If ANY baseline
         // matches sentiment, sentiment has not found anything.
-        let results =
-            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "run",
+            &observations(),
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let comparison = strategy_comparison(&results);
 
         assert!(!comparison.is_empty());
@@ -745,6 +981,7 @@ mod tests {
                         r.metrics.source_set.clone(),
                     ) == *key
                         && r.metrics.strategy != Strategy::Sentiment.as_str()
+                        && r.metrics.split == Split::Holdout.as_str()
                 })
                 .map(|r| r.metrics.net_return_sum)
                 .fold(f64::NEG_INFINITY, f64::max);
@@ -760,14 +997,21 @@ mod tests {
 
     #[test]
     fn backtest_takes_long_and_short_trades_within_a_configuration() {
+        // development_fraction = 1.0: no holdout. The fixture's configurations hold
+        // 2-25 observations, and halving them leaves too few to exercise both trade
+        // sides. This test is about TRADE MECHANICS; the dev/holdout split has its
+        // own test (tests/no_threshold_lookahead.rs) on data built to show it.
         let results = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            5.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 1.0,
+            },
         );
         let result = finance_only_hour_hour_result(&results);
 
@@ -781,11 +1025,14 @@ mod tests {
         let results = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            5.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
         );
 
         assert!(results.len() > 1);
@@ -806,20 +1053,26 @@ mod tests {
         let no_cost = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            0.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
         );
         let with_cost = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            10.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 10.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
         );
         let no_cost_total: f64 = no_cost
             .iter()
@@ -838,11 +1091,14 @@ mod tests {
         let results = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            0.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
         );
         let profitable_short = results
             .iter()
@@ -855,17 +1111,21 @@ mod tests {
 
     #[test]
     fn per_side_metrics_sum_to_combined_metrics() {
+        // See above: mechanics test, no split.
         // Spec's Backtest Rules: "Report long and short sides separately as
         // well as combined." The combined fields must always equal the sum
         // of the long-only and short-only fields for the same trade set.
         let results = run_backtests_by_configuration(
             "stage0_fixture",
             &observations(),
-            0.8,
-            0.2,
-            5.0,
-            0.8,
-            42,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 1.0,
+            },
         );
         let result = finance_only_hour_hour_result(&results);
         let metrics = &result.metrics;
@@ -929,8 +1189,18 @@ mod tests {
             .unwrap();
         assert_eq!(observation.article_ids, vec![normalized.article_id.clone()]);
 
-        let results =
-            run_backtests_by_configuration("stage0_fixture", &observations, 0.8, 0.2, 5.0, 0.8, 42);
+        let results = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 5.0,
+                max_modal_share: 0.8,
+                seed: 42,
+                development_fraction: 0.5,
+            },
+        );
         let trade = results
             .iter()
             .flat_map(|result| result.trades.iter())

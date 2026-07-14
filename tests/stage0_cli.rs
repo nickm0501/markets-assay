@@ -69,19 +69,26 @@ fn run_accepts_checked_in_stage0_config() {
 /// |                     | Loughran-McDonald + VADER, so every sentiment score |
 /// |                     | changed and SENTIMENT_VERSION bumped.              |
 ///
-/// THE VERDICTS ALSO MOVED, twice, and neither is cosmetic.
+/// THE VERDICTS ALSO MOVED, and not cosmetically. The fixture went 5 -> 3 -> 1 -> 0
+/// `continue` across Stage 2. Every step down was a bug fixed or a missing gate
+/// added, never a regression:
 ///
-/// 1. Stage 0 through Stage 1 reported "5 continue, 1 revise". **Two of those
-///    five were floating-point noise**: `observed > shuffled` was TRUE for
-///    spreads equal to fifteen decimal places, because they were summed in a
-///    different order. With `min_spread_margin`, the honest figure was 3 and 3.
-/// 2. Then the four baselines landed (Decision 6's open half). `continue` now
-///    also requires beating EVERY baseline, not just the shuffled one. On the
-///    fixture — synthetic data with a DELIBERATELY PLANTED signal — sentiment
-///    beats all four baselines in only **1 of 6** configurations.
+///   5  Stage 0/1 baseline. TWO WERE FLOATING-POINT NOISE — `observed > shuffled`
+///      was true for spreads equal to fifteen decimal places, differing only in
+///      the order the floats were summed.
+///   3  after `min_spread_margin`.
+///   1  after the four baselines landed (Decision 6's open half): `continue` now
+///      also requires beating EVERY baseline, not just the shuffled one.
+///   0  after the null was fixed (it was a ROTATION, not a shuffle) and the bar
+///      became the null's 95th percentile rather than its mean — the mean is a
+///      coin flip, since ~50% of noise draws beat the mean of their own null.
+///      Plus the dev/holdout split: the spread is now measured on HELD-OUT data
+///      with thresholds frozen from development.
 ///
-/// So the fixture stands at **1 continue, 5 revise**. Each tightening made the
-/// number smaller, and each one was a bug or a missing gate, not a regression.
+/// **The fixture can no longer demonstrate a `continue`, and that is CORRECT.**
+/// Six synthetic articles cannot support a statistically significant result, and
+/// the pipeline now says so instead of pretending otherwise. `continue` is
+/// demonstrated in tests/power_check.rs, on data large enough to earn it.
 const FIXTURE_DATASET_ID: &str = "ds_64a221a5a8ec40a7";
 const FIXTURE_OBSERVATION_SET_ID: &str = "obs_d410aabf8be6f939";
 
@@ -112,8 +119,7 @@ fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
     // One line per verdict value that actually occurred. `run_all` used to
     // print "revise" as `total - continue`, which folded stop/expand data/
     // expand sources into `revise` the moment the full vocabulary existed.
-    .stdout(predicate::str::contains("decisions_continue=1"))
-    .stdout(predicate::str::contains("decisions_revise=5"));
+    .stdout(predicate::str::contains("decisions_revise=6"));
 }
 
 /// Task 9: the leakage check and inspection tables run on every invocation, not
