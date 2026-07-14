@@ -32,6 +32,10 @@ pub fn write_summary(
         .iter()
         .filter(|analysis| analysis.degenerate)
         .count();
+    let vendor_agreement = analyses
+        .first()
+        .map(|analysis| analysis.vendor_agreement)
+        .unwrap_or(0.0);
 
     let mut text = format!(
         "# Research Summary\n\n\
@@ -46,6 +50,7 @@ pub fn write_summary(
          |---|---|---|\n\
          | quarantine_rate | {quarantine_rate:.4} | share of articles with broken/missing timestamps. Drives `stop`. Scope exclusions (out-of-window, wrong symbol, duplicate) are NOT counted here. |\n\
          | lexicon_hit_rate | {lexicon_hit_rate:.4} | share of articles the sentiment scorer could actually read. A low value means we are not measuring sentiment, we are measuring silence. |\n\
+         | vendor_agreement | {vendor_agreement:.4} | Spearman rho between our local scorer and the VENDOR's own read. A BENCHMARK, never traded on. A collapsing value means the scorer has drifted from anything a reader would recognise. |\n\
          | degenerate_configurations | {degenerate_count} | configurations whose sentiment scores were too tied to separate a top from a bottom. These take ZERO trades rather than an all-long book. |\n\n\
          See `reports/set_aside.csv` for every article that did not become an observation,\n\
          and `reports/timestamp_audit.csv` for published_at vs available_at per article.\n\n\
@@ -189,6 +194,7 @@ mod tests {
                 source_set_coverage: 1.0,
                 lexicon_hit_rate: 0.9,
                 degenerate: false,
+                vendor_agreement: 0.5,
                 sentiment_net_return: 0.03,
                 best_baseline_net_return: 0.01,
                 best_baseline_name: "prior_return_momentum".into(),
@@ -209,6 +215,7 @@ mod tests {
                 source_set_coverage: 1.0,
                 lexicon_hit_rate: 0.9,
                 degenerate: false,
+                vendor_agreement: 0.5,
                 sentiment_net_return: 0.005,
                 best_baseline_net_return: 0.02,
                 best_baseline_name: "prior_return_momentum".into(),

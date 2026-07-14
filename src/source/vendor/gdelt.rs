@@ -74,6 +74,9 @@ pub fn parse_gdelt(json: &str) -> Result<Vec<RawArticle>> {
             url: article.url,
             tickers: vec![],
             themes: vec![],
+            // GDELT supplies no sentiment. `None`, never 0.0 — a silent zero would
+            // be indistinguishable from "GDELT read this and thought it neutral".
+            vendor_sentiment: None,
         })
         .collect())
 }

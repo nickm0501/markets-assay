@@ -214,6 +214,22 @@ fn build_analysis_context(
             / articles.len() as f64
     };
 
+    // VENDOR AGREEMENT — the yardstick (design.md Decision 21).
+    //
+    // Spearman rho between our local score and the vendor's own read, over the
+    // articles the vendor labelled. It answers a question we could not otherwise
+    // answer AT ALL: "is our scorer any good?" A collapsing rho is an early
+    // warning that the scorer has drifted from anything a reader would recognise.
+    //
+    // It is a DIAGNOSTIC. It never reaches backtest.rs.
+    let vendor_agreement = spearman(
+        &articles
+            .iter()
+            .filter(|a| a.vendor_sentiment_available)
+            .map(|a| (a.sentiment_score, a.vendor_sentiment))
+            .collect::<Vec<_>>(),
+    );
+
     let catalog: Vec<SourceCatalogRow> = read_parquet(&dataset_dir.join("source_catalog.parquet"))?;
     let finance = catalog
         .iter()
@@ -237,6 +253,7 @@ fn build_analysis_context(
     Ok(AnalysisContext {
         quarantine_rate,
         lexicon_hit_rate,
+        vendor_agreement,
         expected_sources,
         article_sources,
         strategy_nets,
@@ -281,6 +298,51 @@ fn write_audit_reports(
     // hides inside a pile of scope exclusions.
     write_csv(&report_dir.join("set_aside.csv"), &set_aside)?;
     Ok(())
+}
+
+/// Spearman rank correlation. Returns 0.0 when there is nothing to compare.
+fn spearman(pairs: &[(f64, f64)]) -> f64 {
+    if pairs.len() < 3 {
+        return 0.0;
+    }
+    let rank = |values: Vec<f64>| -> Vec<f64> {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|a, b| values[*a].partial_cmp(&values[*b]).unwrap());
+        let mut ranks = vec![0.0; values.len()];
+        let mut i = 0;
+        while i < order.len() {
+            let mut j = i;
+            while j + 1 < order.len() && values[order[j + 1]] == values[order[i]] {
+                j += 1;
+            }
+            // Ties share the average rank, or the correlation is an artefact of
+            // whatever order the sort happened to produce.
+            let average = (i + j) as f64 / 2.0 + 1.0;
+            for item in &order[i..=j] {
+                ranks[*item] = average;
+            }
+            i = j + 1;
+        }
+        ranks
+    };
+    let xs = rank(pairs.iter().map(|p| p.0).collect());
+    let ys = rank(pairs.iter().map(|p| p.1).collect());
+    let n = xs.len() as f64;
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
+    let numerator: f64 = xs
+        .iter()
+        .zip(&ys)
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum();
+    let denominator = (xs.iter().map(|x| (x - mean_x).powi(2)).sum::<f64>()
+        * ys.iter().map(|y| (y - mean_y).powi(2)).sum::<f64>())
+    .sqrt();
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
 }
 
 fn count_disposition(set_aside: &[SetAsideArticle], disposition: Disposition) -> usize {

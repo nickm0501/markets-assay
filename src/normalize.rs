@@ -180,6 +180,10 @@ pub fn normalize_articles(
             relevant_symbols: relevant_symbols.into_iter().collect(),
             sentiment_score: sentiment.score,
             sentiment_label: sentiment.label,
+            // Carried through for comparison only. It must never reach the
+            // strategy — see `vendor_sentiment_never_reaches_the_backtest`.
+            vendor_sentiment: article.vendor_sentiment.unwrap_or(0.0),
+            vendor_sentiment_available: article.vendor_sentiment.is_some(),
             dedupe_key: dedupe_key(article),
         });
     }
@@ -245,6 +249,7 @@ mod tests {
             url: url.into(),
             tickers: vec!["SPY".into()],
             themes: vec![],
+            vendor_sentiment: None,
         }
     }
 

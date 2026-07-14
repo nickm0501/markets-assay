@@ -68,6 +68,8 @@ fn run_accepts_checked_in_stage0_config() {
 /// | ds_64a221a5a8ec40a7 | Stage 2: the 14-word lexicon was replaced by        |
 /// |                     | Loughran-McDonald + VADER, so every sentiment score |
 /// |                     | changed and SENTIMENT_VERSION bumped.              |
+/// | ds_f54fedeadaa2bd75 | Vendor sentiment stored as a benchmark, adding two  |
+/// |                     | columns to normalized_articles.parquet.            |
 ///
 /// THE VERDICTS ALSO MOVED, and not cosmetically. The fixture went 5 -> 3 -> 1 -> 0
 /// `continue` across Stage 2. Every step down was a bug fixed or a missing gate
@@ -89,8 +91,8 @@ fn run_accepts_checked_in_stage0_config() {
 /// Six synthetic articles cannot support a statistically significant result, and
 /// the pipeline now says so instead of pretending otherwise. `continue` is
 /// demonstrated in tests/power_check.rs, on data large enough to earn it.
-const FIXTURE_DATASET_ID: &str = "ds_64a221a5a8ec40a7";
-const FIXTURE_OBSERVATION_SET_ID: &str = "obs_d410aabf8be6f939";
+const FIXTURE_DATASET_ID: &str = "ds_f54fedeadaa2bd75";
+const FIXTURE_OBSERVATION_SET_ID: &str = "obs_51695fe1ee301377";
 
 /// The research loop's output must be unmoved by all of Stage 1's plumbing
 /// work. If the *verdicts* ever change, the refactor broke the science, not

@@ -141,6 +141,8 @@ fn article(
         url: url.into(),
         tickers: tickers.into_iter().map(String::from).collect(),
         themes: themes.into_iter().map(String::from).collect(),
+        // Synthetic data has no vendor to benchmark against.
+        vendor_sentiment: None,
     }
 }
 

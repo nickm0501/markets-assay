@@ -86,6 +86,23 @@ pub struct RawArticle {
     pub url: String,
     pub tickers: Vec<String>,
     pub themes: Vec<String>,
+    /// The VENDOR's own sentiment, averaged across the tickers it tagged.
+    ///
+    /// A BENCHMARK, never a signal (design.md Decision 21). It is free, it covers
+    /// 100% of Massive's articles, and an LLM actually read the article — which
+    /// makes it the only yardstick we have for "is our local scorer any good".
+    ///
+    /// It CANNOT be the signal: it is categorical (positive/neutral/negative), and
+    /// three values cannot be quantiled. Feeding it the spec's rule yields 46%
+    /// long, 54% short and 0% FLAT — every neutral article gets shorted. It also
+    /// covers zero GDELT articles, and it is LLM-generated, so a two-year snapshot
+    /// may mix articles scored by different models over time.
+    ///
+    /// `None` where the vendor supplied none (all GDELT articles). That absence
+    /// must stay visible rather than becoming a silent zero, which would look
+    /// exactly like "the vendor thought this was neutral".
+    #[serde(default)]
+    pub vendor_sentiment: Option<f64>,
 }
 
 /// Why an article never became an observation.
@@ -200,6 +217,22 @@ pub struct NormalizedArticle {
     pub relevant_symbols: Vec<String>,
     pub sentiment_score: f64,
     pub sentiment_label: SentimentLabel,
+    /// The vendor's own read, for comparison only. NEVER reaches `backtest.rs` —
+    /// see `vendor_sentiment_never_reaches_the_backtest`.
+    ///
+    /// Stored as a flat (value, available) pair rather than `Option<f64>`,
+    /// because a Parquet schema must not depend on what the data happens to
+    /// contain. An `Option` whose values are ALL `None` — which is exactly the
+    /// fixture, and exactly every GDELT-only dataset — cannot be typed from
+    /// samples, and the snapshot becomes unwritable. This is the same trap the
+    /// domain enums fell into (see `string_enum!`), and it bit twice.
+    ///
+    /// `vendor_sentiment_available` keeps the ABSENCE visible: a bare 0.0 would be
+    /// indistinguishable from "the vendor read this and thought it neutral".
+    #[serde(default)]
+    pub vendor_sentiment: f64,
+    #[serde(default)]
+    pub vendor_sentiment_available: bool,
     pub dedupe_key: String,
 }
 
@@ -220,6 +253,7 @@ mod tests {
             url: "fixture://after-close".into(),
             tickers: vec![],
             themes: vec!["rates".into()],
+            vendor_sentiment: None,
         };
 
         assert_eq!(

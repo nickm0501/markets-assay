@@ -99,6 +99,7 @@ fn context_for(observations: &[NewsSignalObservation]) -> AnalysisContext {
     AnalysisContext {
         quarantine_rate: 0.0,
         lexicon_hit_rate: 0.9,
+        vendor_agreement: 0.5,
         expected_sources: BTreeMap::from([("finance_only".to_string(), 2)]),
         article_sources: observations
             .iter()

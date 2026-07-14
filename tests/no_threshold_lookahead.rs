@@ -168,3 +168,19 @@ fn the_split_is_chronological_never_random() {
         );
     }
 }
+
+/// Vendor sentiment is a BENCHMARK, never a signal (design.md Decision 21).
+///
+/// If it ever reaches the strategy, the research question silently changes from
+/// "does news sentiment predict returns" to "does Massive's black box predict
+/// returns" — a question we cannot reproduce, version, explain, or debug, and
+/// whose answer the vendor could invalidate by changing their model mid-experiment.
+#[test]
+fn vendor_sentiment_never_reaches_the_backtest() {
+    let backtest = std::fs::read_to_string("src/backtest.rs").unwrap();
+
+    assert!(
+        !backtest.contains("vendor_sentiment"),
+        "backtest.rs must never read vendor_sentiment — it is a yardstick, not a signal"
+    );
+}

@@ -30,6 +30,7 @@ pub struct AnalysisSummary {
     pub source_set_coverage: f64,
     pub lexicon_hit_rate: f64,
     pub degenerate: bool,
+    pub vendor_agreement: f64,
     pub sentiment_net_return: f64,
     pub best_baseline_net_return: f64,
     pub best_baseline_name: String,
@@ -50,6 +51,10 @@ pub struct AnalysisContext {
     /// Share of articles containing at least one word the sentiment lexicon
     /// knows.
     pub lexicon_hit_rate: f64,
+    /// Spearman rho between our local score and the VENDOR's own sentiment.
+    /// A diagnostic, never a signal (design.md Decision 21). It answers the one
+    /// question we otherwise could not: "is our scorer any good?"
+    pub vendor_agreement: f64,
     /// How many distinct sources each `source_set` could draw on, from the
     /// dataset's source catalog. Used to tell "this mixture is thin" from
     /// "this mixture is complete".
@@ -265,6 +270,7 @@ pub fn analyze_observations(
                 source_set_coverage: quality.source_set_coverage,
                 lexicon_hit_rate: quality.lexicon_hit_rate,
                 degenerate,
+                vendor_agreement: context.vendor_agreement,
                 sentiment_net_return: signal.sentiment_net_return,
                 best_baseline_net_return: signal.best_baseline_net_return,
                 best_baseline_name: signal.best_baseline_name.clone(),
@@ -418,6 +424,7 @@ mod tests {
         AnalysisContext {
             quarantine_rate: 0.0,
             lexicon_hit_rate: 1.0,
+            vendor_agreement: 0.5,
             expected_sources: BTreeMap::from([
                 ("finance_only".to_string(), 1),
                 ("broad_news".to_string(), 1),
