@@ -1,6 +1,8 @@
 # Stage 0 Fixture Pipeline Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Living design doc:** `docs/superpowers/design/correlation-first-pipeline/design.md` holds canonical terminology and cross-cutting decisions for this pipeline (this plan and the frozen spec stay dated/unedited historical record). Check it before touching `analysis.rs`, `backtest.rs`, or `report.rs` — Decision 1 there governs the per-configuration grouping used throughout Tasks 7-9.
 
 **Goal:** Build a deterministic synthetic end-to-end market-sentiment research pipeline that writes fixture snapshots, reusable observation sets, analysis reports, backtest reports, and charts without external data.
 
@@ -21,9 +23,17 @@ Stage 0 must prove these properties before any API work:
 - Many `run_id` analysis/backtest outputs can be run against the same observation set.
 - Positive and negative synthetic news can drive long and short trades.
 - Changing costs or thresholds reruns analysis/backtests without regenerating source data.
-- Reports show whether the next decision is `stop`, `revise`, `expand data`, `expand sources`, or `continue`.
+- Reports show, per configuration, whether the mechanics recommend `continue` or `revise`.
 
 Real Massive, GDELT, Alpaca, paid validation, and large historical ingestion are out of scope for this plan.
+
+**Intentionally deferred to Stage 2/3, not built here (design.md Decision 6):** the spec's
+full 5-value decision vocabulary (`stop`/`revise`/`expand data`/`expand sources`/`continue`) and
+its 4 baselines (always-flat, random signal, shuffled sentiment, prior-return momentum). Stage 0's
+synthetic fixture has no real data-quality signal to react to and no meaningful random-seed policy
+to validate, so it implements only `continue`/`revise` and a shuffled-sentiment baseline — enough to
+prove the mechanics, not a real go/no-go verdict. **The full vocabulary and baseline set must exist
+before Stage 2/3 reports are used for an actual go/no-go call** — this is a gate, not a nice-to-have.
 
 ## File Structure
 
@@ -80,9 +90,12 @@ artifacts/
     reports/bucket_returns.csv
     reports/backtest_metrics.csv
     reports/trade_log.csv
+    reports/analysis_summary.json
     charts/bucket_returns.svg
     charts/equity_curve.svg
 ```
+
+`reports/analysis_summary.json` is written by the standalone `analyze` command (Task 7) as a machine-readable form of the per-configuration summaries. `run` (Task 9's `run_all`) does not call `analyze`'s writer directly and does not produce this file — see Task 10 Step 6's expected file listing, which is `run`'s output only.
 
 ## Commands
 
@@ -94,9 +107,10 @@ cargo run -- fixture --config configs/stage0_fixture.json
 cargo run -- build-observations --config configs/stage0_fixture.json --dataset-id <dataset_id>
 cargo run -- analyze --config configs/stage0_fixture.json --observation-set-id <observation_set_id>
 cargo run -- backtest --config configs/stage0_fixture.json --observation-set-id <observation_set_id> --cost-bps 5
+cargo run -- backtest --config configs/stage0_fixture.json --observation-set-id <observation_set_id> --cost-bps 10 --run-id stage0_fixture_cost10
 ```
 
-`run` orchestrates all stages. The other commands make reruns explicit and are required so future stages can reuse source snapshots without redownloading data.
+`run` orchestrates all stages. The other commands make reruns explicit and are required so future stages can reuse source snapshots without redownloading data. `run`, `analyze`, and `backtest` accept an optional `--run-id` that overrides `config.run_id` for that invocation only, defaulting to `config.run_id` when omitted — see Domain Contracts below.
 
 ## Configuration Contract
 
@@ -132,7 +146,7 @@ cargo run -- backtest --config configs/stage0_fixture.json --observation-set-id 
 
 `observation_set_id` is generated from `dataset_id`, aggregation config, sentiment version, relevance-rule version, and observation checksums. It changes when windows, horizons, source sets, relevance rules, or scoring versions change.
 
-`run_id` identifies one analysis/backtest/report output. It may change costs or thresholds without changing `dataset_id` or `observation_set_id`.
+`run_id` identifies one analysis/backtest/report output. Its default value comes from `config.run_id`, but `run`, `analyze`, and `backtest` all accept an optional `--run-id` override for that single invocation. Because the same `dataset_id`/`observation_set_id` can be backtested at different costs or thresholds without regenerating either, a rerun that changes cost or threshold and wants to keep the prior run's `runs/<run_id>/` output on disk (per the spec's Decision Demo "compare both runs" step) must pass a distinct `--run-id`; omitting it reuses `config.run_id` and overwrites that run's `reports/`, `charts/`, `config.json`, `dataset_manifest.json`, and `observation_set_manifest.json` in place.
 
 `published_at` is the article timestamp from the source. `available_at` is when Stage 0 allows the signal to use that article. For regular-hours articles they match. For after-hours articles, `available_at` is deferred to the next regular-session signal time to enforce no-lookahead trading.
 
@@ -310,11 +324,20 @@ impl Stage0Config {
         if self.symbols.is_empty() {
             bail!("symbols must not be empty");
         }
+        if self.news_windows_minutes.is_empty() {
+            bail!("news_windows_minutes must not be empty");
+        }
         if self.news_windows_minutes.iter().any(|minutes| *minutes <= 0) {
             bail!("news_windows_minutes must be positive");
         }
+        if self.measurement_horizons_minutes.is_empty() {
+            bail!("measurement_horizons_minutes must not be empty");
+        }
         if self.measurement_horizons_minutes.iter().any(|minutes| *minutes <= 0) {
             bail!("measurement_horizons_minutes must be positive");
+        }
+        if self.source_sets.is_empty() {
+            bail!("source_sets must not be empty");
         }
         if !(0.0..1.0).contains(&self.short_quantile) {
             bail!("short_quantile must be between 0 and 1");
@@ -350,7 +373,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Run(StageArgs),
+    Run(RunArgs),
     Fixture(StageArgs),
     BuildObservations(StageArgsWithDataset),
     Analyze(StageArgsWithObservationSet),
@@ -375,12 +398,32 @@ struct StageArgsWithDataset {
     dataset_id: String,
 }
 
+// `run_id` here (and on `RunArgs` below) overrides `config.run_id` for this
+// invocation only. It defaults to `config.run_id` when omitted. This exists
+// because `run_id` identifies one analysis/backtest *configuration and
+// result* (spec's Core Terminology; design.md's `configuration` term
+// explicitly includes "one cost/threshold pair" within backtest) — without a
+// way to name a rerun, every `backtest --cost-bps <n>` invocation would
+// write to the same `runs/<run_id>/reports/*.csv` path and silently
+// overwrite the previous cost's results, which defeats the Decision Demo's
+// "compare both runs" step. See design.md Decision (2026-07-10, run_id
+// overrides).
 #[derive(Debug, Parser)]
 struct StageArgsWithObservationSet {
     #[command(flatten)]
     stage: StageArgs,
     #[arg(long)]
     observation_set_id: String,
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct RunArgs {
+    #[command(flatten)]
+    stage: StageArgs,
+    #[arg(long)]
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -394,7 +437,7 @@ struct BacktestArgs {
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(args) => print_loaded_config(args, "run"),
+        Commands::Run(args) => print_loaded_config(args.stage, "run"),
         Commands::Fixture(args) => print_loaded_config(args, "fixture"),
         Commands::BuildObservations(args) => print_loaded_config(args.stage, "build-observations"),
         Commands::Analyze(args) => print_loaded_config(args.stage, "analyze"),
@@ -504,12 +547,39 @@ fn after_hours_article_can_be_deferred_to_next_signal_time() {
 #[test]
 fn next_regular_signal_skips_weekend_and_fixture_holiday() {
     use chrono::{TimeZone, Utc};
+    use std::collections::BTreeMap;
 
     let holidays = vec!["2026-07-03".parse().unwrap()];
+    let early_closes = BTreeMap::new();
     let after_close = Utc.with_ymd_and_hms(2026, 7, 2, 21, 15, 0).unwrap();
-    let next = next_regular_signal_time(after_close, 60, &holidays);
+    let next = next_regular_signal_time(after_close, 60, &holidays, &early_closes);
 
     assert_eq!(next.to_rfc3339(), "2026-07-06T13:30:00+00:00");
+}
+
+#[test]
+fn regular_open_uses_est_offset_outside_daylight_saving() {
+    // Required because calendar.rs must respect DST transitions, not just a
+    // fixed UTC offset (spec Data Quality And Error Handling, Required Tests).
+    let date = "2026-01-05".parse().unwrap();
+    assert_eq!(regular_open(date).to_rfc3339(), "2026-01-05T14:30:00+00:00");
+}
+
+#[test]
+fn regular_open_uses_edt_offset_during_daylight_saving() {
+    let date = "2026-07-06".parse().unwrap();
+    assert_eq!(regular_open(date).to_rfc3339(), "2026-07-06T13:30:00+00:00");
+}
+
+#[test]
+fn regular_close_honors_configured_early_close() {
+    use std::collections::BTreeMap;
+
+    let date: chrono::NaiveDate = "2026-07-02".parse().unwrap();
+    let mut early_closes = BTreeMap::new();
+    early_closes.insert(date, "13:00".to_string());
+
+    assert_eq!(regular_close(date, &early_closes).to_rfc3339(), "2026-07-02T17:00:00+00:00");
 }
 ```
 
@@ -518,7 +588,7 @@ fn next_regular_signal_skips_weekend_and_fixture_holiday() {
 Run:
 
 ```bash
-cargo test stable_id_uses_canonical_json after_hours_article_can_be_deferred_to_next_signal_time next_regular_signal_skips_weekend_and_fixture_holiday
+cargo test stable_id_uses_canonical_json after_hours_article_can_be_deferred_to_next_signal_time next_regular_signal_skips_weekend_and_fixture_holiday regular_open_uses_est_offset_outside_daylight_saving regular_open_uses_edt_offset_during_daylight_saving regular_close_honors_configured_early_close
 ```
 
 Expected: compile failure for missing modules/types.
@@ -670,6 +740,12 @@ Create `src/domain/observation.rs`:
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// `mean_sentiment`, `weighted_sentiment`, `extreme_sentiment`, and
+/// `sentiment_dispersion` together satisfy the spec's Main Research Dataset
+/// requirement for "mean, weighted, extreme, and dispersion sentiment
+/// features" per row. `extreme_sentiment` is the eligible article's
+/// sentiment score with the largest absolute value (sign preserved), i.e.
+/// the single most extreme reading in the window, not just its magnitude.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewsSignalObservation {
     pub observation_id: String,
@@ -688,6 +764,7 @@ pub struct NewsSignalObservation {
     pub publisher_count: u32,
     pub mean_sentiment: f64,
     pub weighted_sentiment: f64,
+    pub extreme_sentiment: f64,
     pub positive_article_count: u32,
     pub negative_article_count: u32,
     pub sentiment_dispersion: f64,
@@ -718,6 +795,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoverageRow {
+    pub news_window_minutes: i64,
+    pub measurement_horizon_minutes: i64,
     pub source_set: String,
     pub symbol: String,
     pub observation_count: u32,
@@ -726,6 +805,8 @@ pub struct CoverageRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BucketReturnRow {
+    pub news_window_minutes: i64,
+    pub measurement_horizon_minutes: i64,
     pub source_set: String,
     pub bucket: String,
     pub observation_count: u32,
@@ -738,6 +819,9 @@ pub struct Trade {
     pub run_id: String,
     pub observation_id: String,
     pub symbol: String,
+    pub news_window_minutes: i64,
+    pub measurement_horizon_minutes: i64,
+    pub source_set: String,
     pub side: String,
     pub signal_time: DateTime<Utc>,
     pub entry_time: DateTime<Utc>,
@@ -748,9 +832,17 @@ pub struct Trade {
     pub net_return: f64,
 }
 
+/// `gross_return_sum`/`net_return_sum`/`win_rate`/`profit_factor` are
+/// combined across both sides. `long_*`/`short_*` report the same measures
+/// scoped to only long or only short trades, satisfying the spec's Backtest
+/// Rules requirement to "report long and short sides separately as well as
+/// combined."
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestMetrics {
     pub run_id: String,
+    pub news_window_minutes: i64,
+    pub measurement_horizon_minutes: i64,
+    pub source_set: String,
     pub cost_bps: f64,
     pub trade_count: u32,
     pub long_count: u32,
@@ -761,6 +853,14 @@ pub struct BacktestMetrics {
     pub win_rate: f64,
     pub profit_factor: f64,
     pub max_drawdown: f64,
+    pub long_gross_return_sum: f64,
+    pub long_net_return_sum: f64,
+    pub long_win_rate: f64,
+    pub long_profit_factor: f64,
+    pub short_gross_return_sum: f64,
+    pub short_net_return_sum: f64,
+    pub short_win_rate: f64,
+    pub short_profit_factor: f64,
 }
 ```
 
@@ -770,34 +870,61 @@ Create `src/calendar.rs`:
 
 ```rust
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::America::New_York;
+use std::collections::BTreeMap;
 
-const OPEN_HOUR_UTC: u32 = 13;
-const OPEN_MINUTE_UTC: u32 = 30;
-const CLOSE_HOUR_UTC: u32 = 20;
+const REGULAR_OPEN_HOUR: u32 = 9;
+const REGULAR_OPEN_MINUTE: u32 = 30;
+const REGULAR_CLOSE_HOUR: u32 = 16;
 
 pub fn is_trading_day(date: NaiveDate, holidays: &[NaiveDate]) -> bool {
     !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&date)
 }
 
+/// NYSE hours are defined in America/New_York local time and converted to
+/// UTC per date, so the UTC offset automatically follows DST transitions
+/// instead of assuming a fixed offset (spec: "respect ... daylight saving
+/// transitions").
+fn local_time_to_utc(date: NaiveDate, time: NaiveTime) -> DateTime<Utc> {
+    New_York
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .expect("NYSE open/close/early-close times never fall in a DST fold or gap")
+        .with_timezone(&Utc)
+}
+
 pub fn regular_open(date: NaiveDate) -> DateTime<Utc> {
-    Utc.from_utc_datetime(&date.and_time(NaiveTime::from_hms_opt(OPEN_HOUR_UTC, OPEN_MINUTE_UTC, 0).unwrap()))
+    local_time_to_utc(date, NaiveTime::from_hms_opt(REGULAR_OPEN_HOUR, REGULAR_OPEN_MINUTE, 0).unwrap())
 }
 
-pub fn regular_close(date: NaiveDate) -> DateTime<Utc> {
-    Utc.from_utc_datetime(&date.and_time(NaiveTime::from_hms_opt(CLOSE_HOUR_UTC, 0, 0).unwrap()))
+/// `early_closes` maps a date to its local "HH:MM" NYSE closing time (e.g.
+/// "13:00" for a 1:00pm ET half day). Dates absent from the map close at the
+/// regular 4:00pm ET time.
+pub fn regular_close(date: NaiveDate, early_closes: &BTreeMap<NaiveDate, String>) -> DateTime<Utc> {
+    if let Some(local_close) = early_closes.get(&date) {
+        let time = NaiveTime::parse_from_str(local_close, "%H:%M")
+            .unwrap_or_else(|_| panic!("early_closes value for {date} must be HH:MM local time, got {local_close}"));
+        return local_time_to_utc(date, time);
+    }
+    local_time_to_utc(date, NaiveTime::from_hms_opt(REGULAR_CLOSE_HOUR, 0, 0).unwrap())
 }
 
-pub fn is_regular_session(time: DateTime<Utc>, holidays: &[NaiveDate]) -> bool {
+pub fn is_regular_session(time: DateTime<Utc>, holidays: &[NaiveDate], early_closes: &BTreeMap<NaiveDate, String>) -> bool {
     let date = time.date_naive();
-    is_trading_day(date, holidays) && time >= regular_open(date) && time < regular_close(date)
+    is_trading_day(date, holidays) && time >= regular_open(date) && time < regular_close(date, early_closes)
 }
 
-pub fn next_regular_signal_time(time: DateTime<Utc>, interval_minutes: i64, holidays: &[NaiveDate]) -> DateTime<Utc> {
+pub fn next_regular_signal_time(
+    time: DateTime<Utc>,
+    interval_minutes: i64,
+    holidays: &[NaiveDate],
+    early_closes: &BTreeMap<NaiveDate, String>,
+) -> DateTime<Utc> {
     let mut date = time.date_naive();
     loop {
         if is_trading_day(date, holidays) {
             let open = regular_open(date);
-            let close = regular_close(date);
+            let close = regular_close(date, early_closes);
             if time <= open {
                 return open;
             }
@@ -818,7 +945,7 @@ Run:
 
 ```bash
 cargo fmt
-cargo test stable_id_uses_canonical_json after_hours_article_can_be_deferred_to_next_signal_time next_regular_signal_skips_weekend_and_fixture_holiday
+cargo test stable_id_uses_canonical_json after_hours_article_can_be_deferred_to_next_signal_time next_regular_signal_skips_weekend_and_fixture_holiday regular_open_uses_est_offset_outside_daylight_saving regular_open_uses_edt_offset_during_daylight_saving regular_close_honors_configured_early_close
 ```
 
 Expected: all selected tests pass.
@@ -984,7 +1111,7 @@ fn generate_price_bars(config: &Stage0Config) -> Result<Vec<PriceBar>> {
             for symbol in &config.symbols {
                 let mut start = regular_open(date);
                 let mut price = if symbol == "SPY" { 500.0 } else { 425.0 };
-                while start < crate::calendar::regular_close(date) {
+                while start < crate::calendar::regular_close(date, &config.early_closes) {
                     let ret = fixture_return(symbol, start);
                     let open = price;
                     let close = open * (1.0 + ret);
@@ -1061,9 +1188,11 @@ use crate::{config::Stage0Config, pipeline};
 Replace `Commands::Run` and `Commands::Fixture` arms:
 
 ```rust
-Commands::Run(args) => run_loaded_config(args, pipeline::run_fixture),
+Commands::Run(args) => run_loaded_config(args.stage, pipeline::run_fixture),
 Commands::Fixture(args) => run_loaded_config(args, pipeline::run_fixture),
 ```
+
+`Commands::Run` holds a `RunArgs` (its `run_id` override field is unused until Task 9 Step 6 replaces this arm with full orchestration); `.stage` extracts the plain `StageArgs` that `run_loaded_config` expects.
 
 Add helper:
 
@@ -1330,10 +1459,10 @@ pub fn normalize_articles(config: &Stage0Config, raw_articles: &[RawArticle]) ->
         };
         let combined_text = format!("{} {}", article.title, article.summary);
         let sentiment = score_text(&combined_text);
-        let available_at = if is_regular_session(article.published_at, &config.holidays) {
+        let available_at = if is_regular_session(article.published_at, &config.holidays, &config.early_closes) {
             article.published_at
         } else {
-            next_regular_signal_time(article.published_at, config.price_interval_minutes, &config.holidays)
+            next_regular_signal_time(article.published_at, config.price_interval_minutes, &config.holidays, &config.early_closes)
         };
         let dedupe_key = dedupe_key(article);
         let article_id = stable_id("art", &(article.source.as_str(), article.url.as_str(), article.published_at))?;
@@ -1679,6 +1808,7 @@ Modify `src/pipeline.rs` so `run_fixture` writes:
 ```rust
 use crate::{
     config::Stage0Config,
+    domain::article::SourceKind,
     fixture::generate_fixture,
     normalize::normalize_articles,
     storage::{
@@ -1690,7 +1820,7 @@ use crate::{
 use anyhow::Result;
 use chrono::NaiveDate;
 use serde::Serialize;
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceCatalogRow {
@@ -1723,10 +1853,21 @@ pub fn run_fixture(config: &Stage0Config, output_root: Option<PathBuf>, dry_run:
     write_jsonl(&raw_path, &fixture.raw_articles)?;
     write_parquet(&normalized_path, &normalized)?;
     write_parquet(&price_path, &fixture.price_bars)?;
-    let source_catalog = vec![
-        SourceCatalogRow { source: "fixture_finance".into(), source_kind: "finance".into() },
-        SourceCatalogRow { source: "fixture_macro".into(), source_kind: "broad".into() },
-    ];
+    // Derived from the fixture's actual raw articles instead of a hardcoded
+    // list, so source_catalog.parquet always reports every distinct source
+    // present in raw_articles.jsonl (fixture_finance, fixture_wire,
+    // fixture_macro, fixture_housing), not just a stale subset.
+    let mut seen_sources = BTreeSet::new();
+    let source_catalog: Vec<SourceCatalogRow> = fixture.raw_articles.iter()
+        .filter(|article| seen_sources.insert(article.source.clone()))
+        .map(|article| SourceCatalogRow {
+            source: article.source.clone(),
+            source_kind: match article.source_kind {
+                SourceKind::Finance => "finance".to_string(),
+                SourceKind::Broad => "broad".to_string(),
+            },
+        })
+        .collect();
     write_parquet(&source_catalog_path, &source_catalog)?;
 
     let files = vec![
@@ -1848,19 +1989,37 @@ mod tests {
 
     #[test]
     fn news_window_uses_available_at_and_excludes_future_articles() {
+        // gdelt-1 (broad, rates theme, published 2026-07-01T13:40:00Z) is
+        // published during the regular session, so available_at ==
+        // published_at and it is eligible at the very next SPY bar
+        // (2026-07-01T14:30:00Z) without ever being deferred. gdelt-2
+        // (broad, rates theme, published 2026-07-02T21:15:00Z, after the
+        // regular close) is deferred to the next regular-session signal
+        // time, which lands on 2026-07-06T13:30:00Z because 2026-07-03 is a
+        // configured fixture holiday and 07-04/07-05 are a weekend (see
+        // calendar.rs's next_regular_signal_skips_weekend_and_fixture_holiday
+        // test). This test pins both the window boundary (before_deferral
+        // must not see gdelt-2) and the after-hours flag (design.md
+        // Decision 5).
         let config = config();
         let fixture = generate_fixture(&config).unwrap();
         let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
         let observations = build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
-        let before_after_hours = observations.iter()
-            .find(|row| row.signal_time.to_rfc3339() == "2026-07-02T19:30:00+00:00" && row.symbol == "SPY" && row.source_set == "broad_news")
+        let before_deferral = observations.iter()
+            .find(|row| row.signal_time.to_rfc3339() == "2026-07-01T14:30:00+00:00" && row.symbol == "SPY" && row.source_set == "broad_news")
             .unwrap();
         let after_holiday = observations.iter()
             .find(|row| row.signal_time.to_rfc3339() == "2026-07-06T13:30:00+00:00" && row.symbol == "SPY" && row.source_set == "broad_news")
             .unwrap();
 
-        assert!(!before_after_hours.article_ids.iter().any(|id| after_holiday.article_ids.contains(id)));
+        assert!(!before_deferral.article_ids.iter().any(|id| after_holiday.article_ids.contains(id)));
         assert!(after_holiday.article_count > 0);
+        // is_after_hours_signal and market_session are computed, not stubbed:
+        // the deferred after-hours article must actually flow through to the
+        // observation it lands in.
+        assert!(after_holiday.is_after_hours_signal);
+        assert!(!before_deferral.is_after_hours_signal);
+        assert_eq!(after_holiday.market_session, "regular");
     }
 
     #[test]
@@ -1878,6 +2037,67 @@ mod tests {
         assert_eq!(spy_positive.entry_time, spy_positive.signal_time);
         assert!(spy_positive.exit_time > spy_positive.entry_time);
     }
+
+    #[test]
+    fn build_observations_aggregates_multi_bar_measurement_horizons() {
+        // The spec's First Experiment Matrix includes horizons like "next
+        // four hours" over one-hour bars. build_one must compound multiple
+        // contiguous bars for these, and must drop (not silently truncate)
+        // any horizon a session close or gap prevents from being fully
+        // covered by contiguous bars.
+        let mut config = config();
+        config.measurement_horizons_minutes = vec![240];
+        let fixture = generate_fixture(&config).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let observations = build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
+
+        let mid_session = observations.iter()
+            .find(|row| {
+                row.symbol == "SPY"
+                    && row.source_set == "finance_only"
+                    && row.news_window_minutes == 240
+                    && row.measurement_horizon_minutes == 240
+                    && row.signal_time.to_rfc3339() == "2026-06-29T15:30:00+00:00"
+            })
+            .unwrap();
+        assert_eq!(mid_session.price_bar_ids.len(), 4);
+        assert_eq!(mid_session.exit_time, mid_session.signal_time + chrono::Duration::minutes(240));
+
+        let near_close_has_no_row = !observations.iter().any(|row| {
+            row.symbol == "SPY"
+                && row.measurement_horizon_minutes == 240
+                && row.signal_time.to_rfc3339() == "2026-06-29T19:30:00+00:00"
+        });
+        assert!(
+            near_close_has_no_row,
+            "a horizon that runs past the session close must be dropped as a coverage gap, not silently truncated"
+        );
+    }
+
+    #[test]
+    fn no_observation_ever_uses_an_article_published_after_its_entry_time() {
+        // Pins down the spec's "enter at the next configured tradable bar
+        // after signal_time" rule (Required Tests: "next-bar and after-hours
+        // execution tests"). entry_time == signal_time == the eligible bar's
+        // open, so this asserts the no-lookahead guarantee directly instead
+        // of relying on the wording alone: every article that contributed to
+        // an observation must have been available at or before that
+        // observation's entry.
+        let config = config();
+        let fixture = generate_fixture(&config).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let observations = build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
+        let articles_by_id: std::collections::BTreeMap<_, _> =
+            articles.iter().map(|article| (article.article_id.clone(), article)).collect();
+
+        assert!(!observations.is_empty());
+        for observation in &observations {
+            for article_id in &observation.article_ids {
+                let article = articles_by_id.get(article_id).unwrap();
+                assert!(article.available_at <= observation.entry_time);
+            }
+        }
+    }
 }
 ```
 
@@ -1886,7 +2106,7 @@ mod tests {
 Run:
 
 ```bash
-cargo test observations_include_one_row_per_symbol_signal_window_horizon_source_set news_window_uses_available_at_and_excludes_future_articles observations_measure_future_returns_after_signal_time
+cargo test observations_include_one_row_per_symbol_signal_window_horizon_source_set news_window_uses_available_at_and_excludes_future_articles observations_measure_future_returns_after_signal_time build_observations_aggregates_multi_bar_measurement_horizons no_observation_ever_uses_an_article_published_after_its_entry_time
 ```
 
 Expected: compile failure for missing `build_observations`.
@@ -1917,6 +2137,7 @@ Create `src/observations.rs` above tests:
 
 ```rust
 use crate::{
+    calendar::is_regular_session,
     config::Stage0Config,
     domain::{
         article::{NewsScope, NormalizedArticle, SentimentLabel, SourceKind},
@@ -1980,23 +2201,54 @@ fn build_one(
     if eligible.is_empty() {
         return Ok(None);
     }
+    // Sum every contiguous price bar from signal_time through exit_time so
+    // horizons wider than one price_interval (e.g. spec's "next four hours"
+    // over 1h bars) are measured correctly instead of silently producing no
+    // observation. If the bars covering the window aren't fully contiguous
+    // (e.g. a holiday or session close truncates it), the observation is
+    // dropped rather than aggregated over a partial, misleading window.
     let exit_time = signal_time + Duration::minutes(measurement_horizon_minutes);
-    let future_bar = price_bars.iter()
-        .find(|bar| bar.symbol == signal_bar.symbol && bar.start_time == signal_time && bar.end_time == exit_time);
-    let Some(future_bar) = future_bar else {
+    let mut future_bars: Vec<&PriceBar> = price_bars.iter()
+        .filter(|bar| bar.symbol == signal_bar.symbol && bar.start_time >= signal_time && bar.end_time <= exit_time)
+        .collect();
+    future_bars.sort_by_key(|bar| bar.start_time);
+    let spans_full_horizon = future_bars.first().is_some_and(|bar| bar.start_time == signal_time)
+        && future_bars.last().is_some_and(|bar| bar.end_time == exit_time)
+        && future_bars.windows(2).all(|pair| pair[0].end_time == pair[1].start_time);
+    if !spans_full_horizon {
         return Ok(None);
-    };
+    }
+    let future_open = future_bars.first().unwrap().open;
+    let future_close = future_bars.last().unwrap().close;
+    let future_high = future_bars.iter().map(|bar| bar.high).fold(f64::MIN, f64::max);
+    let future_low = future_bars.iter().map(|bar| bar.low).fold(f64::MAX, f64::min);
     let prior_bar = price_bars.iter()
         .filter(|bar| bar.symbol == signal_bar.symbol && bar.end_time <= signal_time)
         .max_by_key(|bar| bar.end_time);
     let article_count = eligible.len() as u32;
     let mean_sentiment = eligible.iter().map(|article| article.sentiment_score).sum::<f64>() / article_count as f64;
     let dispersion = eligible.iter().map(|article| (article.sentiment_score - mean_sentiment).abs()).sum::<f64>() / article_count as f64;
+    // Sign-preserving: the single eligible article whose score is furthest
+    // from zero, not just the largest magnitude on its own.
+    let extreme_sentiment = eligible.iter()
+        .map(|article| article.sentiment_score)
+        .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap())
+        .unwrap_or(0.0);
     let sources: BTreeSet<_> = eligible.iter().map(|article| article.source.clone()).collect();
     let article_ids: Vec<_> = eligible.iter().map(|article| article.article_id.clone()).collect();
-    let price_bar_ids = vec![signal_bar.bar_id.clone(), future_bar.bar_id.clone()];
+    let price_bar_ids: Vec<String> = future_bars.iter().map(|bar| bar.bar_id.clone()).collect();
     let observation_id = stable_id("sig", &(dataset_id, signal_bar.symbol.as_str(), signal_time, news_window_minutes, measurement_horizon_minutes, source_set, &article_ids))?;
-    let future_return = (future_bar.close - future_bar.open) / future_bar.open;
+    let future_return = (future_close - future_open) / future_open;
+    // Computed rather than stubbed so the fixture's after-hours article
+    // (deferred available_at != published_at) actually flows through to the
+    // observation instead of being silently discarded.
+    let is_after_hours_signal = eligible.iter().any(|article| article.available_at != article.published_at);
+    let market_session = if is_regular_session(signal_time, &config.holidays, &config.early_closes) {
+        "regular"
+    } else {
+        "after_hours"
+    }
+    .to_string();
 
     Ok(Some(NewsSignalObservation {
         observation_id,
@@ -2015,18 +2267,19 @@ fn build_one(
         publisher_count: sources.len() as u32,
         mean_sentiment,
         weighted_sentiment: mean_sentiment,
+        extreme_sentiment,
         positive_article_count: eligible.iter().filter(|article| article.sentiment_label == SentimentLabel::Positive).count() as u32,
         negative_article_count: eligible.iter().filter(|article| article.sentiment_label == SentimentLabel::Negative).count() as u32,
         sentiment_dispersion: dispersion,
         prior_return: prior_bar.map(|bar| bar.return_pct()).unwrap_or(0.0),
         prior_volatility: prior_bar.map(|bar| bar.high / bar.low - 1.0).unwrap_or(0.0),
-        market_session: "regular".into(),
-        is_after_hours_signal: false,
+        market_session,
+        is_after_hours_signal,
         future_return,
-        future_volatility: future_bar.high / future_bar.low - 1.0,
+        future_volatility: future_high / future_low - 1.0,
         future_tail_event: future_return.abs() >= 0.006,
-        future_max_drawdown: (future_bar.low - future_bar.open) / future_bar.open,
-        future_max_runup: (future_bar.high - future_bar.open) / future_bar.open,
+        future_max_drawdown: (future_low - future_open) / future_open,
+        future_max_runup: (future_high - future_open) / future_open,
         entry_time: signal_time,
         exit_time,
         article_ids,
@@ -2189,7 +2442,7 @@ Run:
 
 ```bash
 cargo fmt
-cargo test observations_include_one_row_per_symbol_signal_window_horizon_source_set news_window_uses_available_at_and_excludes_future_articles observations_measure_future_returns_after_signal_time
+cargo test observations_include_one_row_per_symbol_signal_window_horizon_source_set news_window_uses_available_at_and_excludes_future_articles observations_measure_future_returns_after_signal_time build_observations_aggregates_multi_bar_measurement_horizons no_observation_ever_uses_an_article_published_after_its_entry_time
 cargo test --test stage0_cli build_observations_reuses_dataset_snapshot
 ```
 
@@ -2230,25 +2483,40 @@ mod tests {
     }
 
     #[test]
-    fn coverage_counts_observations_and_articles_by_source_set_and_symbol() {
+    fn coverage_counts_observations_and_articles_by_window_horizon_source_set_and_symbol() {
         let rows = coverage_rows(&observations());
 
-        assert!(rows.iter().any(|row| row.symbol == "SPY" && row.source_set == "finance_only" && row.observation_count > 0));
-        assert!(rows.iter().any(|row| row.symbol == "QQQ" && row.source_set == "broad_news" && row.article_count > 0));
+        assert!(rows.iter().any(|row| row.symbol == "SPY" && row.news_window_minutes == 60 && row.source_set == "finance_only" && row.observation_count > 0));
+        assert!(rows.iter().any(|row| row.symbol == "QQQ" && row.news_window_minutes == 240 && row.source_set == "broad_news" && row.article_count > 0));
     }
 
     #[test]
-    fn sentiment_buckets_show_synthetic_top_minus_bottom_spread() {
+    fn sentiment_buckets_show_synthetic_top_minus_bottom_spread_within_a_configuration() {
         let rows = bucket_return_rows(&observations(), 3);
-        let high = rows.iter().find(|row| row.bucket == "high").unwrap();
-        let low = rows.iter().find(|row| row.bucket == "low").unwrap();
+        let configuration_rows: Vec<_> = rows.iter()
+            .filter(|row| row.news_window_minutes == 60 && row.measurement_horizon_minutes == 60 && row.source_set == "finance_only")
+            .collect();
+        let high = configuration_rows.iter().find(|row| row.bucket == "high").unwrap();
+        let low = configuration_rows.iter().find(|row| row.bucket == "low").unwrap();
 
         assert!(high.mean_future_return > low.mean_future_return);
     }
 
     #[test]
-    fn shuffled_baseline_is_worse_than_observed_spread() {
-        let summary = analyze_observations(&observations());
+    fn analyze_observations_returns_one_summary_per_configuration_not_pooled() {
+        let summaries = analyze_observations(&observations());
+        let configuration_count = configuration_groups(&observations()).len();
+
+        assert_eq!(summaries.len(), configuration_count);
+        assert!(configuration_count > 1);
+    }
+
+    #[test]
+    fn shuffled_baseline_is_worse_than_observed_spread_for_the_finance_only_configuration() {
+        let summaries = analyze_observations(&observations());
+        let summary = summaries.iter()
+            .find(|summary| summary.news_window_minutes == 60 && summary.measurement_horizon_minutes == 60 && summary.source_set == "finance_only")
+            .unwrap();
 
         assert!(summary.observed_top_minus_bottom > summary.shuffled_top_minus_bottom);
     }
@@ -2260,7 +2528,7 @@ mod tests {
 Run:
 
 ```bash
-cargo test coverage_counts_observations_and_articles_by_source_set_and_symbol sentiment_buckets_show_synthetic_top_minus_bottom_spread shuffled_baseline_is_worse_than_observed_spread
+cargo test coverage_counts_observations_and_articles_by_window_horizon_source_set_and_symbol sentiment_buckets_show_synthetic_top_minus_bottom_spread_within_a_configuration analyze_observations_returns_one_summary_per_configuration_not_pooled shuffled_baseline_is_worse_than_observed_spread_for_the_finance_only_configuration
 ```
 
 Expected: compile failure for missing analysis functions.
@@ -2295,22 +2563,45 @@ use crate::domain::{observation::NewsSignalObservation, run::{BucketReturnRow, C
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub type ConfigurationKey = (i64, i64, String);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisSummary {
+    pub news_window_minutes: i64,
+    pub measurement_horizon_minutes: i64,
+    pub source_set: String,
+    pub observation_count: u32,
     pub observed_top_minus_bottom: f64,
     pub shuffled_top_minus_bottom: f64,
     pub pearson_correlation: f64,
     pub recommendation: String,
 }
 
-pub fn coverage_rows(observations: &[NewsSignalObservation]) -> Vec<CoverageRow> {
-    let mut grouped: BTreeMap<(String, String), (u32, u32)> = BTreeMap::new();
+/// `run_id` is defined as one analysis/backtest configuration and result
+/// (see design.md Decision 1), so every analysis and backtest function below
+/// groups by this key instead of pooling across configurations.
+pub fn configuration_groups(observations: &[NewsSignalObservation]) -> BTreeMap<ConfigurationKey, Vec<&NewsSignalObservation>> {
+    let mut groups: BTreeMap<ConfigurationKey, Vec<&NewsSignalObservation>> = BTreeMap::new();
     for row in observations {
-        let entry = grouped.entry((row.source_set.clone(), row.symbol.clone())).or_default();
+        groups
+            .entry((row.news_window_minutes, row.measurement_horizon_minutes, row.source_set.clone()))
+            .or_default()
+            .push(row);
+    }
+    groups
+}
+
+pub fn coverage_rows(observations: &[NewsSignalObservation]) -> Vec<CoverageRow> {
+    let mut grouped: BTreeMap<(i64, i64, String, String), (u32, u32)> = BTreeMap::new();
+    for row in observations {
+        let key = (row.news_window_minutes, row.measurement_horizon_minutes, row.source_set.clone(), row.symbol.clone());
+        let entry = grouped.entry(key).or_default();
         entry.0 += 1;
         entry.1 += row.article_count;
     }
-    grouped.into_iter().map(|((source_set, symbol), (observation_count, article_count))| CoverageRow {
+    grouped.into_iter().map(|((news_window_minutes, measurement_horizon_minutes, source_set, symbol), (observation_count, article_count))| CoverageRow {
+        news_window_minutes,
+        measurement_horizon_minutes,
         source_set,
         symbol,
         observation_count,
@@ -2318,8 +2609,8 @@ pub fn coverage_rows(observations: &[NewsSignalObservation]) -> Vec<CoverageRow>
     }).collect()
 }
 
-pub fn bucket_return_rows(observations: &[NewsSignalObservation], bucket_count: usize) -> Vec<BucketReturnRow> {
-    let mut sorted = observations.to_vec();
+fn bucket_rows_for_group(key: &ConfigurationKey, group: &[&NewsSignalObservation], bucket_count: usize) -> Vec<BucketReturnRow> {
+    let mut sorted: Vec<&NewsSignalObservation> = group.to_vec();
     sorted.sort_by(|a, b| a.mean_sentiment.partial_cmp(&b.mean_sentiment).unwrap());
     let mut rows = Vec::new();
     for (idx, label) in ["low", "middle", "high"].iter().enumerate().take(bucket_count) {
@@ -2327,7 +2618,9 @@ pub fn bucket_return_rows(observations: &[NewsSignalObservation], bucket_count: 
         let end = ((idx + 1) * sorted.len() / bucket_count).max(start + 1).min(sorted.len());
         let slice = &sorted[start..end];
         rows.push(BucketReturnRow {
-            source_set: "all".into(),
+            news_window_minutes: key.0,
+            measurement_horizon_minutes: key.1,
+            source_set: key.2.clone(),
             bucket: (*label).into(),
             observation_count: slice.len() as u32,
             mean_sentiment: mean(slice.iter().map(|row| row.mean_sentiment)),
@@ -2337,46 +2630,71 @@ pub fn bucket_return_rows(observations: &[NewsSignalObservation], bucket_count: 
     rows
 }
 
-pub fn analyze_observations(observations: &[NewsSignalObservation]) -> AnalysisSummary {
-    let rows = bucket_return_rows(observations, 3);
-    let low = rows.iter().find(|row| row.bucket == "low").map(|row| row.mean_future_return).unwrap_or(0.0);
-    let high = rows.iter().find(|row| row.bucket == "high").map(|row| row.mean_future_return).unwrap_or(0.0);
-    let shuffled = shuffled_spread(observations);
-    let observed = high - low;
-    let recommendation = if observed > shuffled && observed > 0.0 {
-        "continue".to_string()
-    } else {
-        "revise".to_string()
-    };
-    AnalysisSummary {
-        observed_top_minus_bottom: observed,
-        shuffled_top_minus_bottom: shuffled,
-        pearson_correlation: pearson(observations),
-        recommendation,
-    }
+pub fn bucket_return_rows(observations: &[NewsSignalObservation], bucket_count: usize) -> Vec<BucketReturnRow> {
+    configuration_groups(observations)
+        .iter()
+        .flat_map(|(key, group)| bucket_rows_for_group(key, group, bucket_count))
+        .collect()
 }
 
-fn shuffled_spread(observations: &[NewsSignalObservation]) -> f64 {
-    if observations.len() < 3 {
-        return 0.0;
-    }
-    let mut shuffled = observations.to_vec();
-    let sentiments: Vec<f64> = shuffled.iter().map(|row| row.mean_sentiment).collect();
-    for (idx, row) in shuffled.iter_mut().enumerate() {
-        row.mean_sentiment = sentiments[(idx + 1) % sentiments.len()];
-    }
-    let rows = bucket_return_rows(&shuffled, 3);
-    let low = rows.iter().find(|row| row.bucket == "low").map(|row| row.mean_future_return).unwrap_or(0.0);
-    let high = rows.iter().find(|row| row.bucket == "high").map(|row| row.mean_future_return).unwrap_or(0.0);
+/// Returns one summary per (news_window, measurement_horizon, source_set)
+/// configuration. Never collapse this back into a single pooled summary —
+/// that was the Task 7 defect design.md Decision 1 corrects.
+pub fn analyze_observations(observations: &[NewsSignalObservation]) -> Vec<AnalysisSummary> {
+    configuration_groups(observations)
+        .into_iter()
+        .map(|(key, group)| {
+            let rows = bucket_rows_for_group(&key, &group, 3);
+            let low = rows.iter().find(|row| row.bucket == "low").map(|row| row.mean_future_return).unwrap_or(0.0);
+            let high = rows.iter().find(|row| row.bucket == "high").map(|row| row.mean_future_return).unwrap_or(0.0);
+            let observed = high - low;
+            let shuffled = shuffled_spread(&group);
+            let recommendation = if observed > shuffled && observed > 0.0 {
+                "continue".to_string()
+            } else {
+                "revise".to_string()
+            };
+            AnalysisSummary {
+                news_window_minutes: key.0,
+                measurement_horizon_minutes: key.1,
+                source_set: key.2,
+                observation_count: group.len() as u32,
+                observed_top_minus_bottom: observed,
+                shuffled_top_minus_bottom: shuffled,
+                pearson_correlation: pearson(&group),
+                recommendation,
+            }
+        })
+        .collect()
+}
+
+fn top_minus_bottom(pairs: &[(f64, f64)]) -> f64 {
+    let mut sorted = pairs.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let bucket_size = (sorted.len() / 3).max(1);
+    let high_start = sorted.len().saturating_sub(bucket_size);
+    let low = mean(sorted[..bucket_size.min(sorted.len())].iter().map(|(_, r)| *r));
+    let high = mean(sorted[high_start..].iter().map(|(_, r)| *r));
     high - low
 }
 
-fn pearson(observations: &[NewsSignalObservation]) -> f64 {
-    let x_mean = mean(observations.iter().map(|row| row.mean_sentiment));
-    let y_mean = mean(observations.iter().map(|row| row.future_return));
-    let numerator: f64 = observations.iter().map(|row| (row.mean_sentiment - x_mean) * (row.future_return - y_mean)).sum();
-    let x_var: f64 = observations.iter().map(|row| (row.mean_sentiment - x_mean).powi(2)).sum();
-    let y_var: f64 = observations.iter().map(|row| (row.future_return - y_mean).powi(2)).sum();
+fn shuffled_spread(group: &[&NewsSignalObservation]) -> f64 {
+    if group.len() < 3 {
+        return 0.0;
+    }
+    let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
+    let shuffled_pairs: Vec<(f64, f64)> = group.iter().enumerate()
+        .map(|(idx, row)| (sentiments[(idx + 1) % sentiments.len()], row.future_return))
+        .collect();
+    top_minus_bottom(&shuffled_pairs)
+}
+
+fn pearson(group: &[&NewsSignalObservation]) -> f64 {
+    let x_mean = mean(group.iter().map(|row| row.mean_sentiment));
+    let y_mean = mean(group.iter().map(|row| row.future_return));
+    let numerator: f64 = group.iter().map(|row| (row.mean_sentiment - x_mean) * (row.future_return - y_mean)).sum();
+    let x_var: f64 = group.iter().map(|row| (row.mean_sentiment - x_mean).powi(2)).sum();
+    let y_var: f64 = group.iter().map(|row| (row.future_return - y_mean).powi(2)).sum();
     if x_var == 0.0 || y_var == 0.0 { 0.0 } else { numerator / (x_var.sqrt() * y_var.sqrt()) }
 }
 
@@ -2397,27 +2715,32 @@ Modify `src/pipeline.rs`:
 
 ```rust
 use crate::{analysis::{analyze_observations, bucket_return_rows, coverage_rows}, domain::observation::NewsSignalObservation};
+use anyhow::Context;
+use std::path::Path;
 
 pub fn run_analyze(
     config: &Stage0Config,
     output_root: Option<PathBuf>,
     dry_run: bool,
     observation_set_id: &str,
+    run_id: &str,
 ) -> Result<()> {
     let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
     let observation_dir = root.join("data").join("observation_sets").join(observation_set_id);
     let observations: Vec<NewsSignalObservation> = read_parquet(&observation_dir.join("news_signal_observations.parquet"))?;
-    let summary = analyze_observations(&observations);
+    let summaries = analyze_observations(&observations);
+    let continue_count = summaries.iter().filter(|summary| summary.recommendation == "continue").count();
     if dry_run {
-        println!("analysis dry_run=true recommendation={}", summary.recommendation);
+        println!("analysis dry_run=true configurations={} continue={}", summaries.len(), continue_count);
         return Ok(());
     }
-    let report_dir = root.join("runs").join(&config.run_id).join("reports");
+    let report_dir = root.join("runs").join(run_id).join("reports");
     fs::create_dir_all(&report_dir)?;
     write_csv(&report_dir.join("coverage.csv"), &coverage_rows(&observations))?;
     write_csv(&report_dir.join("bucket_returns.csv"), &bucket_return_rows(&observations, 3))?;
-    fs::write(report_dir.join("analysis_summary.json"), serde_json::to_string_pretty(&summary)?)?;
-    println!("analysis_recommendation={}", summary.recommendation);
+    fs::write(report_dir.join("analysis_summary.json"), serde_json::to_string_pretty(&summaries)?)?;
+    write_run_manifests(config, &root, run_id, observation_set_id)?;
+    println!("analysis_configurations={} analysis_continue={}", summaries.len(), continue_count);
     Ok(())
 }
 
@@ -2432,6 +2755,37 @@ fn write_csv<T: serde::Serialize>(path: &std::path::Path, rows: &[T]) -> Result<
     writer.flush()?;
     Ok(())
 }
+
+/// Writes `runs/<run_id>/config.json`, `dataset_manifest.json`, and
+/// `observation_set_manifest.json`, per the spec's Stored Data section
+/// ("Each run lives under runs/<run_id>/: config.json, dataset_manifest.json,
+/// observation_set_manifest.json, reports/..."). Shared by `run_analyze`
+/// (this task), `run_backtest_command` (Task 8), and `run_all` (Task 9) —
+/// all three write into `runs/<run_id>/` and must keep these files current.
+/// `config.json` records the *effective* `run_id` actually used for this
+/// invocation (which may differ from `config.run_id` when the caller passed
+/// `--run-id`, see Task 1 Step 8's CLI changes), not the raw value loaded
+/// from the config file, so the file on disk matches the directory it lives
+/// in.
+fn write_run_manifests(config: &Stage0Config, root: &Path, run_id: &str, observation_set_id: &str) -> Result<()> {
+    let observation_dir = root.join("data").join("observation_sets").join(observation_set_id);
+    let observation_manifest_bytes = fs::read(observation_dir.join("manifest.json"))
+        .with_context(|| format!("failed to read observation set manifest for {observation_set_id}"))?;
+    let observation_manifest: crate::storage::manifest::ObservationSetManifest =
+        serde_json::from_slice(&observation_manifest_bytes)?;
+    let dataset_dir = root.join("data").join("datasets").join(&observation_manifest.input.dataset_id);
+    let dataset_manifest_bytes = fs::read(dataset_dir.join("manifest.json"))
+        .with_context(|| format!("failed to read dataset manifest for {}", observation_manifest.input.dataset_id))?;
+
+    let run_dir = root.join("runs").join(run_id);
+    fs::create_dir_all(&run_dir)?;
+    let mut config_snapshot = config.clone();
+    config_snapshot.run_id = run_id.to_string();
+    fs::write(run_dir.join("config.json"), serde_json::to_string_pretty(&config_snapshot)?)?;
+    fs::write(run_dir.join("dataset_manifest.json"), &dataset_manifest_bytes)?;
+    fs::write(run_dir.join("observation_set_manifest.json"), &observation_manifest_bytes)?;
+    Ok(())
+}
 ```
 
 - [ ] **Step 6: Route the CLI analyze command**
@@ -2441,7 +2795,8 @@ Modify `src/cli.rs`:
 ```rust
 Commands::Analyze(args) => {
     let config = Stage0Config::load(&args.stage.config)?;
-    pipeline::run_analyze(&config, args.stage.output_root, args.stage.dry_run, &args.observation_set_id)
+    let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
+    pipeline::run_analyze(&config, args.stage.output_root, args.stage.dry_run, &args.observation_set_id, &run_id)
 }
 ```
 
@@ -2468,12 +2823,17 @@ fn analyze_writes_reusable_report_tables() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("analysis_recommendation=continue"));
+    .stdout(predicate::str::contains("analysis_configurations="));
 
     let reports = temp.path().join("runs/stage0_fixture/reports");
     assert!(reports.join("coverage.csv").exists());
     assert!(reports.join("bucket_returns.csv").exists());
     assert!(reports.join("analysis_summary.json").exists());
+
+    let run_dir = temp.path().join("runs/stage0_fixture");
+    assert!(run_dir.join("config.json").exists());
+    assert!(run_dir.join("dataset_manifest.json").exists());
+    assert!(run_dir.join("observation_set_manifest.json").exists());
 }
 
 fn run_build_observations_and_extract_observation_set_id(root: &std::path::Path, dataset_id: &str) -> String {
@@ -2502,7 +2862,7 @@ Run:
 
 ```bash
 cargo fmt
-cargo test coverage_counts_observations_and_articles_by_source_set_and_symbol sentiment_buckets_show_synthetic_top_minus_bottom_spread shuffled_baseline_is_worse_than_observed_spread
+cargo test coverage_counts_observations_and_articles_by_window_horizon_source_set_and_symbol sentiment_buckets_show_synthetic_top_minus_bottom_spread_within_a_configuration analyze_observations_returns_one_summary_per_configuration_not_pooled shuffled_baseline_is_worse_than_observed_spread_for_the_finance_only_configuration
 cargo test --test stage0_cli analyze_writes_reusable_report_tables
 ```
 
@@ -2542,9 +2902,16 @@ mod tests {
         build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap()
     }
 
+    fn finance_only_hour_hour_result(results: &[BacktestResult]) -> &BacktestResult {
+        results.iter()
+            .find(|result| result.metrics.news_window_minutes == 60 && result.metrics.measurement_horizon_minutes == 60 && result.metrics.source_set == "finance_only")
+            .unwrap()
+    }
+
     #[test]
-    fn backtest_takes_long_and_short_trades() {
-        let result = run_backtest("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+    fn backtest_takes_long_and_short_trades_within_a_configuration() {
+        let results = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+        let result = finance_only_hour_hour_result(&results);
 
         assert!(result.metrics.long_count > 0);
         assert!(result.metrics.short_count > 0);
@@ -2552,19 +2919,94 @@ mod tests {
     }
 
     #[test]
-    fn costs_reduce_net_returns() {
-        let no_cost = run_backtest("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
-        let with_cost = run_backtest("stage0_fixture", &observations(), 0.8, 0.2, 10.0);
+    fn backtest_does_not_mix_trade_slots_across_configurations() {
+        let results = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
 
-        assert!(with_cost.metrics.net_return_sum < no_cost.metrics.net_return_sum);
+        assert!(results.len() > 1);
+        assert!(results.iter().all(|result| result.trades.iter().all(|trade| {
+            trade.news_window_minutes == result.metrics.news_window_minutes
+                && trade.measurement_horizon_minutes == result.metrics.measurement_horizon_minutes
+                && trade.source_set == result.metrics.source_set
+        })));
+    }
+
+    #[test]
+    fn costs_reduce_net_returns() {
+        let no_cost = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
+        let with_cost = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 10.0);
+        let no_cost_total: f64 = no_cost.iter().map(|result| result.metrics.net_return_sum).sum();
+        let with_cost_total: f64 = with_cost.iter().map(|result| result.metrics.net_return_sum).sum();
+
+        assert!(with_cost_total < no_cost_total);
     }
 
     #[test]
     fn short_trade_profit_uses_negative_future_return() {
-        let result = run_backtest("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
-        let profitable_short = result.trades.iter().find(|trade| trade.side == "short" && trade.gross_return > 0.0).unwrap();
+        let results = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
+        let profitable_short = results.iter()
+            .flat_map(|result| result.trades.iter())
+            .find(|trade| trade.side == "short" && trade.gross_return > 0.0)
+            .unwrap();
 
         assert!(profitable_short.net_return > 0.0);
+    }
+
+    #[test]
+    fn per_side_metrics_sum_to_combined_metrics() {
+        // Spec's Backtest Rules: "Report long and short sides separately as
+        // well as combined." The combined fields must always equal the sum
+        // of the long-only and short-only fields for the same trade set.
+        let results = run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+        let result = finance_only_hour_hour_result(&results);
+        let metrics = &result.metrics;
+
+        assert!((metrics.gross_return_sum - (metrics.long_gross_return_sum + metrics.short_gross_return_sum)).abs() < 1e-9);
+        assert!((metrics.net_return_sum - (metrics.long_net_return_sum + metrics.short_net_return_sum)).abs() < 1e-9);
+        assert!(metrics.long_count > 0);
+        assert!(metrics.short_count > 0);
+    }
+
+    #[test]
+    fn traces_one_fixture_article_from_raw_input_through_normalization_observation_and_trade() {
+        // Required Tests: "A manually traceable fixture observation from raw
+        // article through trade." massive-1 (SPY, finance, published
+        // 2026-06-29T14:05:00Z) is the sole finance-only article eligible
+        // for the SPY 2026-06-29T15:30:00Z / 240-minute-window /
+        // 60-minute-horizon observation: window_start is 11:30, so
+        // available_at 14:05 falls inside (11:30, 15:30], and massive-2 (the
+        // only other finance article) is published on a different day so it
+        // can never appear in this window. A long_quantile of 0.0 makes
+        // every observation in the (240, 60, finance_only) group qualify as
+        // "long" (threshold == the group's minimum sentiment), so the trade
+        // outcome does not depend on the rest of the fixture's sentiment
+        // distribution.
+        let config = Stage0Config::load("configs/stage0_fixture.json").unwrap();
+        let fixture = generate_fixture(&config).unwrap();
+        let raw = fixture.raw_articles.iter().find(|article| article.vendor_id == "massive-1").unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let normalized = articles.iter().find(|article| article.vendor_id == "massive-1").unwrap();
+        assert_eq!(raw.url, normalized.url);
+
+        let observations = build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
+        let observation = observations.iter()
+            .find(|row| {
+                row.symbol == "SPY"
+                    && row.source_set == "finance_only"
+                    && row.news_window_minutes == 240
+                    && row.measurement_horizon_minutes == 60
+                    && row.signal_time.to_rfc3339() == "2026-06-29T15:30:00+00:00"
+            })
+            .unwrap();
+        assert_eq!(observation.article_ids, vec![normalized.article_id.clone()]);
+
+        let results = run_backtests_by_configuration("stage0_fixture", &observations, 0.0, 0.0, 5.0);
+        let trade = results.iter()
+            .flat_map(|result| result.trades.iter())
+            .find(|trade| trade.observation_id == observation.observation_id)
+            .unwrap();
+
+        assert_eq!(trade.symbol, "SPY");
+        assert_eq!(trade.side, "long");
     }
 }
 ```
@@ -2574,7 +3016,7 @@ mod tests {
 Run:
 
 ```bash
-cargo test backtest_takes_long_and_short_trades costs_reduce_net_returns short_trade_profit_uses_negative_future_return
+cargo test backtest_takes_long_and_short_trades_within_a_configuration backtest_does_not_mix_trade_slots_across_configurations costs_reduce_net_returns short_trade_profit_uses_negative_future_return per_side_metrics_sum_to_combined_metrics traces_one_fixture_article_from_raw_input_through_normalization_observation_and_trade
 ```
 
 Expected: compile failure for missing `run_backtest`.
@@ -2616,9 +3058,34 @@ pub struct BacktestResult {
     pub trades: Vec<Trade>,
 }
 
-pub fn run_backtest(
+/// One BacktestResult per (news_window, measurement_horizon, source_set)
+/// configuration, per design.md Decision 1. Quantile thresholds and the
+/// overlap-skip trade-slot logic must stay scoped to one configuration —
+/// pooling them lets unrelated configurations compete for the same trade.
+pub fn run_backtests_by_configuration(
     run_id: &str,
     observations: &[NewsSignalObservation],
+    long_quantile: f64,
+    short_quantile: f64,
+    cost_bps: f64,
+) -> Vec<BacktestResult> {
+    let mut groups: BTreeMap<(i64, i64, String), Vec<&NewsSignalObservation>> = BTreeMap::new();
+    for row in observations {
+        groups
+            .entry((row.news_window_minutes, row.measurement_horizon_minutes, row.source_set.clone()))
+            .or_default()
+            .push(row);
+    }
+    groups
+        .into_iter()
+        .map(|(key, group)| run_backtest_for_configuration(run_id, &key, &group, long_quantile, short_quantile, cost_bps))
+        .collect()
+}
+
+fn run_backtest_for_configuration(
+    run_id: &str,
+    key: &(i64, i64, String),
+    observations: &[&NewsSignalObservation],
     long_quantile: f64,
     short_quantile: f64,
     cost_bps: f64,
@@ -2626,7 +3093,7 @@ pub fn run_backtest(
     let long_threshold = quantile(observations.iter().map(|row| row.mean_sentiment).collect(), long_quantile);
     let short_threshold = quantile(observations.iter().map(|row| row.mean_sentiment).collect(), short_quantile);
     let mut last_exit_by_symbol = BTreeMap::<String, chrono::DateTime<chrono::Utc>>::new();
-    let mut sorted = observations.to_vec();
+    let mut sorted: Vec<&NewsSignalObservation> = observations.to_vec();
     sorted.sort_by_key(|row| (row.entry_time, row.symbol.clone()));
     let mut trades = Vec::new();
     for row in sorted {
@@ -2645,8 +3112,11 @@ pub fn run_backtest(
         last_exit_by_symbol.insert(row.symbol.clone(), row.exit_time);
         trades.push(Trade {
             run_id: run_id.into(),
-            observation_id: row.observation_id,
-            symbol: row.symbol,
+            observation_id: row.observation_id.clone(),
+            symbol: row.symbol.clone(),
+            news_window_minutes: key.0,
+            measurement_horizon_minutes: key.1,
+            source_set: key.2.clone(),
             side: side.into(),
             signal_time: row.signal_time,
             entry_time: row.entry_time,
@@ -2657,7 +3127,7 @@ pub fn run_backtest(
             net_return,
         });
     }
-    let metrics = metrics(run_id, cost_bps, &trades);
+    let metrics = metrics(run_id, key, cost_bps, &trades);
     BacktestResult { metrics, trades }
 }
 
@@ -2670,14 +3140,19 @@ fn quantile(mut values: Vec<f64>, q: f64) -> f64 {
     values[idx]
 }
 
-fn metrics(run_id: &str, cost_bps: f64, trades: &[Trade]) -> BacktestMetrics {
+fn metrics(run_id: &str, key: &(i64, i64, String), cost_bps: f64, trades: &[Trade]) -> BacktestMetrics {
     let gross_return_sum: f64 = trades.iter().map(|trade| trade.gross_return).sum();
     let net_return_sum: f64 = trades.iter().map(|trade| trade.net_return).sum();
     let wins = trades.iter().filter(|trade| trade.net_return > 0.0).count() as f64;
     let gains: f64 = trades.iter().filter(|trade| trade.net_return > 0.0).map(|trade| trade.net_return).sum();
     let losses: f64 = trades.iter().filter(|trade| trade.net_return < 0.0).map(|trade| trade.net_return.abs()).sum();
+    let (long_gross_return_sum, long_net_return_sum, long_win_rate, long_profit_factor) = side_summary(trades, "long");
+    let (short_gross_return_sum, short_net_return_sum, short_win_rate, short_profit_factor) = side_summary(trades, "short");
     BacktestMetrics {
         run_id: run_id.into(),
+        news_window_minutes: key.0,
+        measurement_horizon_minutes: key.1,
+        source_set: key.2.clone(),
         cost_bps,
         trade_count: trades.len() as u32,
         long_count: trades.iter().filter(|trade| trade.side == "long").count() as u32,
@@ -2688,7 +3163,32 @@ fn metrics(run_id: &str, cost_bps: f64, trades: &[Trade]) -> BacktestMetrics {
         win_rate: if trades.is_empty() { 0.0 } else { wins / trades.len() as f64 },
         profit_factor: if losses == 0.0 { gains } else { gains / losses },
         max_drawdown: max_drawdown(trades),
+        long_gross_return_sum,
+        long_net_return_sum,
+        long_win_rate,
+        long_profit_factor,
+        short_gross_return_sum,
+        short_net_return_sum,
+        short_win_rate,
+        short_profit_factor,
     }
+}
+
+/// Returns `(gross_return_sum, net_return_sum, win_rate, profit_factor)`
+/// scoped to only the given `side` ("long" or "short"), mirroring the
+/// combined computation above so `BacktestMetrics` can report both — spec's
+/// Backtest Rules: "Report long and short sides separately as well as
+/// combined."
+fn side_summary(trades: &[Trade], side: &str) -> (f64, f64, f64, f64) {
+    let side_trades: Vec<&Trade> = trades.iter().filter(|trade| trade.side == side).collect();
+    let gross_return_sum: f64 = side_trades.iter().map(|trade| trade.gross_return).sum();
+    let net_return_sum: f64 = side_trades.iter().map(|trade| trade.net_return).sum();
+    let wins = side_trades.iter().filter(|trade| trade.net_return > 0.0).count() as f64;
+    let gains: f64 = side_trades.iter().filter(|trade| trade.net_return > 0.0).map(|trade| trade.net_return).sum();
+    let losses: f64 = side_trades.iter().filter(|trade| trade.net_return < 0.0).map(|trade| trade.net_return.abs()).sum();
+    let win_rate = if side_trades.is_empty() { 0.0 } else { wins / side_trades.len() as f64 };
+    let profit_factor = if losses == 0.0 { gains } else { gains / losses };
+    (gross_return_sum, net_return_sum, win_rate, profit_factor)
 }
 
 fn max_drawdown(trades: &[Trade]) -> f64 {
@@ -2714,7 +3214,7 @@ fn max_drawdown(trades: &[Trade]) -> f64 {
 Modify `src/pipeline.rs`:
 
 ```rust
-use crate::backtest::run_backtest;
+use crate::backtest::run_backtests_by_configuration;
 
 pub fn run_backtest_command(
     config: &Stage0Config,
@@ -2722,24 +3222,32 @@ pub fn run_backtest_command(
     dry_run: bool,
     observation_set_id: &str,
     cost_bps: Option<f64>,
+    run_id: &str,
 ) -> Result<()> {
     let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
     let observation_dir = root.join("data").join("observation_sets").join(observation_set_id);
     let observations: Vec<NewsSignalObservation> = read_parquet(&observation_dir.join("news_signal_observations.parquet"))?;
     let cost_bps = cost_bps.unwrap_or_else(|| config.costs_bps.first().copied().unwrap_or(0.0));
-    let result = run_backtest(&config.run_id, &observations, config.long_quantile, config.short_quantile, cost_bps);
+    let results = run_backtests_by_configuration(run_id, &observations, config.long_quantile, config.short_quantile, cost_bps);
+    let total_trades: usize = results.iter().map(|result| result.trades.len()).sum();
     if dry_run {
-        println!("backtest dry_run=true trades={} net_return_sum={}", result.metrics.trade_count, result.metrics.net_return_sum);
+        let net_return_sum: f64 = results.iter().map(|result| result.metrics.net_return_sum).sum();
+        println!("backtest dry_run=true configurations={} trades={} net_return_sum={}", results.len(), total_trades, net_return_sum);
         return Ok(());
     }
-    let report_dir = root.join("runs").join(&config.run_id).join("reports");
+    let report_dir = root.join("runs").join(run_id).join("reports");
     fs::create_dir_all(&report_dir)?;
-    write_csv(&report_dir.join("backtest_metrics.csv"), &[result.metrics])?;
-    write_csv(&report_dir.join("trade_log.csv"), &result.trades)?;
-    println!("backtest_trades={}", result.trades.len());
+    let metrics: Vec<_> = results.iter().map(|result| result.metrics.clone()).collect();
+    let trades: Vec<_> = results.iter().flat_map(|result| result.trades.clone()).collect();
+    write_csv(&report_dir.join("backtest_metrics.csv"), &metrics)?;
+    write_csv(&report_dir.join("trade_log.csv"), &trades)?;
+    write_run_manifests(config, &root, run_id, observation_set_id)?;
+    println!("backtest_configurations={} backtest_trades={}", results.len(), total_trades);
     Ok(())
 }
 ```
+
+`run_backtests_by_configuration` and every `Trade`/`BacktestMetrics` row now carry the *effective* `run_id` (the `--run-id` override if one was passed, otherwise `config.run_id`) instead of always `config.run_id` — see Task 1 Step 8's CLI changes and the note on `StageArgsWithObservationSet`.
 
 - [ ] **Step 6: Route the CLI backtest command**
 
@@ -2748,15 +3256,19 @@ Modify `src/cli.rs`:
 ```rust
 Commands::Backtest(args) => {
     let config = Stage0Config::load(&args.observation.stage.config)?;
+    let run_id = args.observation.run_id.clone().unwrap_or_else(|| config.run_id.clone());
     pipeline::run_backtest_command(
         &config,
         args.observation.stage.output_root,
         args.observation.stage.dry_run,
         &args.observation.observation_set_id,
         args.cost_bps,
+        &run_id,
     )
 }
 ```
+
+This is the last `Commands` arm that still called `print_loaded_config` (`Run`, `Fixture`, `BuildObservations`, and `Analyze` were already migrated in Tasks 3, 6, and 7). Delete the now-unused `print_loaded_config` function from `src/cli.rs` in this step — leaving it in place is dead code and fails `cargo clippy --all-targets -- -D warnings` in Task 10 Step 5.
 
 - [ ] **Step 7: Add CLI test for rerunning costs**
 
@@ -2791,6 +3303,42 @@ fn backtest_reruns_with_changed_cost_without_rebuilding_dataset() {
     assert!(temp.path().join("runs/stage0_fixture/reports/backtest_metrics.csv").exists());
     assert!(temp.path().join("runs/stage0_fixture/reports/trade_log.csv").exists());
 }
+
+#[test]
+fn distinct_run_ids_keep_separate_backtest_reports_for_comparison() {
+    // Decision Demo step 6 ("compare both runs") requires that changing a
+    // cost assumption and rerunning does not overwrite the first run's
+    // reports. Passing a distinct --run-id per cost keeps both on disk.
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id = run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    for (run_id, cost) in [("stage0_fixture_cost0", "0"), ("stage0_fixture_cost10", "10")] {
+        let mut cmd = Command::cargo_bin("markets").unwrap();
+        cmd.args([
+            "backtest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+            "--observation-set-id",
+            &observation_set_id,
+            "--cost-bps",
+            cost,
+            "--run-id",
+            run_id,
+        ])
+        .assert()
+        .success();
+    }
+
+    let low_cost_metrics = std::fs::read_to_string(temp.path().join("runs/stage0_fixture_cost0/reports/backtest_metrics.csv")).unwrap();
+    let high_cost_metrics = std::fs::read_to_string(temp.path().join("runs/stage0_fixture_cost10/reports/backtest_metrics.csv")).unwrap();
+
+    assert!(temp.path().join("runs/stage0_fixture_cost0/config.json").exists());
+    assert!(temp.path().join("runs/stage0_fixture_cost10/config.json").exists());
+    assert_ne!(low_cost_metrics, high_cost_metrics);
+}
 ```
 
 - [ ] **Step 8: Run tests and commit**
@@ -2799,8 +3347,8 @@ Run:
 
 ```bash
 cargo fmt
-cargo test backtest_takes_long_and_short_trades costs_reduce_net_returns short_trade_profit_uses_negative_future_return
-cargo test --test stage0_cli backtest_reruns_with_changed_cost_without_rebuilding_dataset
+cargo test backtest_takes_long_and_short_trades_within_a_configuration backtest_does_not_mix_trade_slots_across_configurations costs_reduce_net_returns short_trade_profit_uses_negative_future_return per_side_metrics_sum_to_combined_metrics traces_one_fixture_article_from_raw_input_through_normalization_observation_and_trade
+cargo test --test stage0_cli backtest_reruns_with_changed_cost_without_rebuilding_dataset distinct_run_ids_keep_separate_backtest_reports_for_comparison
 ```
 
 Expected: all selected tests pass.
@@ -2833,35 +3381,93 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn summary_markdown_contains_lineage_metrics_and_decision() {
+    fn summary_markdown_lists_one_row_per_configuration() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("summary.md");
-        let analysis = AnalysisSummary {
-            observed_top_minus_bottom: 0.01,
-            shuffled_top_minus_bottom: 0.0,
-            pearson_correlation: 0.4,
-            recommendation: "continue".into(),
-        };
-        let metrics = BacktestMetrics {
-            run_id: "stage0_fixture".into(),
-            cost_bps: 5.0,
-            trade_count: 4,
-            long_count: 2,
-            short_count: 2,
-            gross_return_sum: 0.03,
-            net_return_sum: 0.028,
-            average_net_return: 0.007,
-            win_rate: 0.75,
-            profit_factor: 3.0,
-            max_drawdown: -0.002,
-        };
+        let analyses = vec![
+            AnalysisSummary {
+                news_window_minutes: 60,
+                measurement_horizon_minutes: 60,
+                source_set: "finance_only".into(),
+                observation_count: 4,
+                observed_top_minus_bottom: 0.01,
+                shuffled_top_minus_bottom: 0.0,
+                pearson_correlation: 0.4,
+                recommendation: "continue".into(),
+            },
+            AnalysisSummary {
+                news_window_minutes: 240,
+                measurement_horizon_minutes: 60,
+                source_set: "broad_news".into(),
+                observation_count: 3,
+                observed_top_minus_bottom: -0.002,
+                shuffled_top_minus_bottom: 0.001,
+                pearson_correlation: -0.1,
+                recommendation: "revise".into(),
+            },
+        ];
+        let metrics = vec![
+            BacktestMetrics {
+                run_id: "stage0_fixture".into(),
+                news_window_minutes: 60,
+                measurement_horizon_minutes: 60,
+                source_set: "finance_only".into(),
+                cost_bps: 5.0,
+                trade_count: 4,
+                long_count: 2,
+                short_count: 2,
+                gross_return_sum: 0.03,
+                net_return_sum: 0.028,
+                average_net_return: 0.007,
+                win_rate: 0.75,
+                profit_factor: 3.0,
+                max_drawdown: -0.002,
+                long_gross_return_sum: 0.02,
+                long_net_return_sum: 0.019,
+                long_win_rate: 1.0,
+                long_profit_factor: 19.0,
+                short_gross_return_sum: 0.01,
+                short_net_return_sum: 0.009,
+                short_win_rate: 0.5,
+                short_profit_factor: 1.5,
+            },
+            BacktestMetrics {
+                run_id: "stage0_fixture".into(),
+                news_window_minutes: 240,
+                measurement_horizon_minutes: 60,
+                source_set: "broad_news".into(),
+                cost_bps: 5.0,
+                trade_count: 3,
+                long_count: 1,
+                short_count: 1,
+                gross_return_sum: -0.001,
+                net_return_sum: -0.002,
+                average_net_return: -0.0007,
+                win_rate: 0.33,
+                profit_factor: 0.5,
+                max_drawdown: -0.004,
+                long_gross_return_sum: 0.0005,
+                long_net_return_sum: 0.0,
+                long_win_rate: 0.0,
+                long_profit_factor: 0.0,
+                short_gross_return_sum: -0.0015,
+                short_net_return_sum: -0.002,
+                short_win_rate: 0.0,
+                short_profit_factor: 0.0,
+            },
+        ];
 
-        write_summary(&path, "ds_test", "obs_test", &analysis, &metrics).unwrap();
+        write_summary(&path, "ds_test", "obs_test", &analyses, &metrics).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
 
         assert!(text.contains("dataset_id: ds_test"));
         assert!(text.contains("observation_set_id: obs_test"));
-        assert!(text.contains("Decision: continue"));
+        assert!(text.contains("configurations: 2"));
+        assert!(text.contains("| 60 | 60 | finance_only |"));
+        assert!(text.contains("continue"));
+        assert!(text.contains("revise"));
+        assert!(text.contains("long_net_return_sum"));
+        assert!(text.contains("short_net_return_sum"));
     }
 
     #[test]
@@ -2881,7 +3487,7 @@ mod tests {
 Run:
 
 ```bash
-cargo test summary_markdown_contains_lineage_metrics_and_decision svg_chart_files_are_written
+cargo test summary_markdown_lists_one_row_per_configuration svg_chart_files_are_written
 ```
 
 Expected: compile failure for missing report functions.
@@ -2919,37 +3525,73 @@ use anyhow::Result;
 use plotters::prelude::*;
 use std::{fs, path::Path};
 
+/// One row per (news_window, measurement_horizon, source_set) configuration.
+/// Never collapse this into a single blended verdict (design.md Decision 1) —
+/// configurations are meant to be compared, not merged.
 pub fn write_summary(
     path: &Path,
     dataset_id: &str,
     observation_set_id: &str,
-    analysis: &AnalysisSummary,
-    metrics: &BacktestMetrics,
+    analyses: &[AnalysisSummary],
+    metrics: &[BacktestMetrics],
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let text = format!(
+    let continue_count = analyses.iter().filter(|analysis| analysis.recommendation == "continue").count();
+    let mut text = format!(
         "# Stage 0 Research Summary\n\n\
          dataset_id: {dataset_id}\n\n\
          observation_set_id: {observation_set_id}\n\n\
-         run_id: {}\n\n\
-         Decision: {}\n\n\
-         observed_top_minus_bottom: {:.6}\n\n\
-         shuffled_top_minus_bottom: {:.6}\n\n\
-         pearson_correlation: {:.6}\n\n\
-         trade_count: {}\n\n\
-         net_return_sum: {:.6}\n\n\
-         win_rate: {:.2}\n",
-        metrics.run_id,
-        analysis.recommendation,
-        analysis.observed_top_minus_bottom,
-        analysis.shuffled_top_minus_bottom,
-        analysis.pearson_correlation,
-        metrics.trade_count,
-        metrics.net_return_sum,
-        metrics.win_rate,
+         configurations: {}\n\n\
+         continue: {continue_count}\n\n\
+         Each row below is one (news_window, measurement_horizon, source_set) configuration.\n\
+         Configurations are never blended into a single verdict (design.md Decision 1).\n\
+         Long and short sides are reported separately as well as combined (spec Backtest Rules).\n\n\
+         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        analyses.len(),
     );
+    for analysis in analyses {
+        let matching_metrics = metrics.iter().find(|metric| {
+            metric.news_window_minutes == analysis.news_window_minutes
+                && metric.measurement_horizon_minutes == analysis.measurement_horizon_minutes
+                && metric.source_set == analysis.source_set
+        });
+        let (trade_count, net_return_sum, win_rate, long_count, long_net_return_sum, long_win_rate, short_count, short_net_return_sum, short_win_rate) = matching_metrics
+            .map(|metric| (
+                metric.trade_count,
+                metric.net_return_sum,
+                metric.win_rate,
+                metric.long_count,
+                metric.long_net_return_sum,
+                metric.long_win_rate,
+                metric.short_count,
+                metric.short_net_return_sum,
+                metric.short_win_rate,
+            ))
+            .unwrap_or((0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0));
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
+            analysis.news_window_minutes,
+            analysis.measurement_horizon_minutes,
+            analysis.source_set,
+            analysis.observation_count,
+            analysis.recommendation,
+            analysis.observed_top_minus_bottom,
+            analysis.shuffled_top_minus_bottom,
+            analysis.pearson_correlation,
+            trade_count,
+            net_return_sum,
+            win_rate,
+            long_count,
+            long_net_return_sum,
+            long_win_rate,
+            short_count,
+            short_net_return_sum,
+            short_win_rate,
+        ));
+    }
     fs::write(path, text)?;
     Ok(())
 }
@@ -3002,46 +3644,132 @@ pub fn write_equity_curve(path: &Path, equity: &[f64]) -> Result<()> {
 Modify `src/pipeline.rs` by adding a complete orchestrator:
 
 ```rust
-pub fn run_all(config: &Stage0Config, output_root: Option<PathBuf>, dry_run: bool) -> Result<()> {
+pub fn run_all(config: &Stage0Config, output_root: Option<PathBuf>, dry_run: bool, run_id: &str) -> Result<()> {
     let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
-    let dataset_id = create_dataset_snapshot(config, &root, dry_run)?;
-    let observation_set_id = create_observation_set(config, &root, &dataset_id, dry_run)?;
+    // `dry_run` short-circuits before any snapshot/observation work, matching
+    // the `run_accepts_checked_in_stage0_config` CLI test added in Task 1
+    // (which asserts stdout contains the run_id and "dry_run=true"). This is
+    // required because create_dataset_snapshot/create_observation_set only
+    // compute a real dataset_id/observation_set_id after writing files and
+    // hashing them — there is no meaningful id to produce in dry-run mode.
+    if dry_run {
+        println!("run run_id={run_id} output_root={} dry_run=true", root.display());
+        return Ok(());
+    }
+    let dataset_id = create_dataset_snapshot(config, &root, false)?;
+    let observation_set_id = create_observation_set(config, &root, &dataset_id, false)?;
     let observations: Vec<NewsSignalObservation> = read_parquet(
         &root.join("data").join("observation_sets").join(&observation_set_id).join("news_signal_observations.parquet")
     )?;
-    let analysis = analyze_observations(&observations);
-    let backtest = run_backtest(&config.run_id, &observations, config.long_quantile, config.short_quantile, 5.0);
-    let run_dir = root.join("runs").join(&config.run_id);
+    let analyses = analyze_observations(&observations);
+    let cost_bps = config.costs_bps.first().copied().unwrap_or(0.0);
+    let backtests = run_backtests_by_configuration(run_id, &observations, config.long_quantile, config.short_quantile, cost_bps);
+    let metrics: Vec<_> = backtests.iter().map(|result| result.metrics.clone()).collect();
+    let trades: Vec<_> = backtests.iter().flat_map(|result| result.trades.clone()).collect();
+    let run_dir = root.join("runs").join(run_id);
     let report_dir = run_dir.join("reports");
     let chart_dir = run_dir.join("charts");
     fs::create_dir_all(&report_dir)?;
     fs::create_dir_all(&chart_dir)?;
-    write_summary(&report_dir.join("summary.md"), &dataset_id, &observation_set_id, &analysis, &backtest.metrics)?;
-    write_bucket_chart(
-        &chart_dir.join("bucket_returns.svg"),
-        &bucket_return_rows(&observations, 3).into_iter().map(|row| (row.bucket, row.mean_future_return)).collect::<Vec<_>>(),
-    )?;
+    // run_all must write the same reports/*.csv files the standalone
+    // `analyze` and `backtest` commands write (Tasks 7-8) — the Step 7 CLI
+    // test below and Task 10 Step 6's expected file listing both assert
+    // these exist after `run`, not just summary.md and the two charts.
+    write_csv(&report_dir.join("coverage.csv"), &coverage_rows(&observations))?;
+    write_csv(&report_dir.join("bucket_returns.csv"), &bucket_return_rows(&observations, 3))?;
+    write_csv(&report_dir.join("backtest_metrics.csv"), &metrics)?;
+    write_csv(&report_dir.join("trade_log.csv"), &trades)?;
+    write_summary(&report_dir.join("summary.md"), &dataset_id, &observation_set_id, &analyses, &metrics)?;
+    // Same runs/<run_id>/{config.json,dataset_manifest.json,
+    // observation_set_manifest.json} the standalone `analyze` and `backtest`
+    // commands write (Task 7/8's write_run_manifests) — required by the
+    // spec's Stored Data section and asserted by Task 10 Step 6's expected
+    // file listing.
+    write_run_manifests(config, &root, run_id, &observation_set_id)?;
+
+    // Charts illustrate one representative configuration for the Stage 0 demo.
+    // The summary table above, not the chart, is the source of truth across
+    // all configurations (design.md Decision 1).
+    let primary_key = (
+        config.news_windows_minutes[0],
+        config.measurement_horizons_minutes[0],
+        config.source_sets[0].clone(),
+    );
+    let primary_bucket_rows: Vec<_> = bucket_return_rows(&observations, 3)
+        .into_iter()
+        .filter(|row| (row.news_window_minutes, row.measurement_horizon_minutes, row.source_set.clone()) == primary_key)
+        .map(|row| (row.bucket, row.mean_future_return))
+        .collect();
+    write_bucket_chart(&chart_dir.join("bucket_returns.svg"), &primary_bucket_rows)?;
+
+    let primary_trades = backtests
+        .iter()
+        .find(|result| {
+            (result.metrics.news_window_minutes, result.metrics.measurement_horizon_minutes, result.metrics.source_set.clone()) == primary_key
+        })
+        .map(|result| result.trades.as_slice())
+        .unwrap_or(&[]);
     let mut equity = vec![0.0];
-    for trade in &backtest.trades {
+    for trade in primary_trades {
         equity.push(equity.last().copied().unwrap_or(0.0) + trade.net_return);
     }
     write_equity_curve(&chart_dir.join("equity_curve.svg"), &equity)?;
+
+    let continue_count = analyses.iter().filter(|analysis| analysis.recommendation == "continue").count();
     println!("dataset_id={dataset_id}");
     println!("observation_set_id={observation_set_id}");
-    println!("decision={}", analysis.recommendation);
+    println!("configurations={}", analyses.len());
+    println!("decisions_continue={continue_count} decisions_revise={}", analyses.len() - continue_count);
     Ok(())
 }
 ```
 
-Refactor the existing `run_fixture` and `run_build_observations` internals into private helpers named `create_dataset_snapshot` and `create_observation_set` so the CLI commands and `run_all` share one implementation.
+Refactor the existing `run_fixture` and `run_build_observations` internals into private helpers `fn create_dataset_snapshot(config: &Stage0Config, root: &Path, dry_run: bool) -> Result<String>` and `fn create_observation_set(config: &Stage0Config, root: &Path, dataset_id: &str, dry_run: bool) -> Result<String>` so the CLI commands and `run_all` share one implementation.
+
+Both helpers keep their own `dry_run` preview-line `println!` (e.g. `"fixture run_id=... articles=... price_bars=..."` / `"observation_set dry_run=true rows=..."`) exactly as `run_fixture`/`run_build_observations` already do in Tasks 5-6 — that preview behavior is still required for the standalone `fixture` and `build-observations` CLI commands, and `dry_run` short-circuits before any file is written either way. `run_all` never triggers that branch itself because it only calls these helpers after its own dry-run guard (Step 5 above) has already returned, always passing `false`.
+
+The **non-dry-run success** `println!("dataset_id={id}")` / `println!("observation_set_id={id}")` lines do **not** move into the helpers — they stay in the thin `run_fixture` and `run_build_observations` wrappers, which now look like:
+
+```rust
+pub fn run_fixture(config: &Stage0Config, output_root: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
+    let dataset_id = create_dataset_snapshot(config, &root, dry_run)?;
+    if !dry_run {
+        println!("dataset_id={dataset_id}");
+    }
+    Ok(())
+}
+
+pub fn run_build_observations(
+    config: &Stage0Config,
+    output_root: Option<PathBuf>,
+    dry_run: bool,
+    dataset_id: &str,
+) -> Result<()> {
+    let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
+    let observation_set_id = create_observation_set(config, &root, dataset_id, dry_run)?;
+    if !dry_run {
+        println!("observation_set_id={observation_set_id}");
+    }
+    Ok(())
+}
+```
+
+This is why `run_all` (Step 5 above) prints its own `dataset_id={dataset_id}` / `observation_set_id={observation_set_id}` lines explicitly after calling the helpers: the helpers themselves never print an id, so there is exactly one place each id gets printed on any given code path, and no double-print.
 
 - [ ] **Step 6: Route `run` through full orchestration**
 
 Modify `src/cli.rs`:
 
 ```rust
-Commands::Run(args) => run_loaded_config(args, pipeline::run_all),
+Commands::Run(args) => {
+    let config = Stage0Config::load(&args.stage.config)?;
+    let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
+    pipeline::run_all(&config, args.stage.output_root, args.stage.dry_run, &run_id)
+}
 ```
+
+This replaces the `run_loaded_config(args.stage, pipeline::run_fixture)` arm Task 3 Step 6 introduced as a placeholder — `run_all`'s signature (`config, output_root, dry_run, run_id`) no longer matches the `fn(&Stage0Config, Option<PathBuf>, bool) -> Result<()>` shape `run_loaded_config` expects, so `Commands::Run` is handled inline here instead of through that helper. `run_loaded_config` is still used by `Commands::Fixture`.
 
 - [ ] **Step 7: Add end-to-end CLI test for summary and charts**
 
@@ -3063,7 +3791,7 @@ fn run_writes_summary_charts_and_decision() {
     .success()
     .stdout(predicate::str::contains("dataset_id=ds_"))
     .stdout(predicate::str::contains("observation_set_id=obs_"))
-    .stdout(predicate::str::contains("decision=continue"));
+    .stdout(predicate::str::contains("configurations="));
 
     let run_dir = temp.path().join("runs/stage0_fixture");
     assert!(run_dir.join("reports/summary.md").exists());
@@ -3073,6 +3801,9 @@ fn run_writes_summary_charts_and_decision() {
     assert!(run_dir.join("reports/trade_log.csv").exists());
     assert!(run_dir.join("charts/bucket_returns.svg").exists());
     assert!(run_dir.join("charts/equity_curve.svg").exists());
+    assert!(run_dir.join("config.json").exists());
+    assert!(run_dir.join("dataset_manifest.json").exists());
+    assert!(run_dir.join("observation_set_manifest.json").exists());
 }
 ```
 
@@ -3082,7 +3813,7 @@ Run:
 
 ```bash
 cargo fmt
-cargo test summary_markdown_contains_lineage_metrics_and_decision svg_chart_files_are_written
+cargo test summary_markdown_lists_one_row_per_configuration svg_chart_files_are_written
 cargo test --test stage0_cli run_writes_summary_charts_and_decision
 ```
 
@@ -3172,13 +3903,17 @@ Generated outputs:
 - `artifacts/runs/stage0_fixture/reports/summary.md`
 - `artifacts/runs/stage0_fixture/charts/`
 
-Rerun a changed cost assumption without rebuilding the dataset:
+Rerun a changed cost assumption without rebuilding the dataset, comparing both runs by giving the rerun its own `--run-id` (otherwise it overwrites `runs/stage0_fixture/`):
 
 ```bash
 cargo run -- backtest \
   --config configs/stage0_fixture.json \
   --observation-set-id <observation_set_id> \
-  --cost-bps 10
+  --cost-bps 10 \
+  --run-id stage0_fixture_cost10
+
+diff artifacts/runs/stage0_fixture/reports/backtest_metrics.csv \
+     artifacts/runs/stage0_fixture_cost10/reports/backtest_metrics.csv
 ```
 ```
 
@@ -3210,7 +3945,7 @@ Expected:
 - `cargo fmt --check` passes.
 - `cargo clippy --all-targets -- -D warnings` passes.
 - `cargo test` passes.
-- `cargo run -- run --config configs/stage0_fixture.json` prints `dataset_id=ds_`, `observation_set_id=obs_`, and `decision=continue`.
+- `cargo run -- run --config configs/stage0_fixture.json` prints `dataset_id=ds_`, `observation_set_id=obs_`, `configurations=`, and `decisions_continue=`/`decisions_revise=` counts (one recommendation per configuration, never a single blended verdict — see `docs/superpowers/design/correlation-first-pipeline/design.md` Decision 1).
 
 - [ ] **Step 6: Inspect generated outputs**
 
@@ -3225,12 +3960,17 @@ Expected output includes:
 ```text
 artifacts/runs/stage0_fixture/charts/bucket_returns.svg
 artifacts/runs/stage0_fixture/charts/equity_curve.svg
+artifacts/runs/stage0_fixture/config.json
+artifacts/runs/stage0_fixture/dataset_manifest.json
+artifacts/runs/stage0_fixture/observation_set_manifest.json
 artifacts/runs/stage0_fixture/reports/backtest_metrics.csv
 artifacts/runs/stage0_fixture/reports/bucket_returns.csv
 artifacts/runs/stage0_fixture/reports/coverage.csv
 artifacts/runs/stage0_fixture/reports/summary.md
 artifacts/runs/stage0_fixture/reports/trade_log.csv
 ```
+
+`run` (Task 9's `run_all`) does not call `analyze`'s standalone writer, so `reports/analysis_summary.json` is intentionally absent from this listing — see the Artifact Layout section's note.
 
 - [ ] **Step 7: Commit**
 
@@ -3260,6 +4000,20 @@ Spec coverage:
 - Long/short/flat and cost-sensitive backtests are covered by Task 8.
 - Decision demo outputs, charts, and reruns are covered by Tasks 7, 9, and 10.
 - External free data sources are intentionally excluded because this plan implements Stage 0 only.
+- Analysis, backtest, and report generation operate per `(news_window, measurement_horizon, source_set)`
+  configuration and never pool across configurations — see
+  `docs/superpowers/design/correlation-first-pipeline/design.md` Decision 1. This was corrected after
+  the initial draft pooled everything into a single global recommendation, which would have propagated
+  unchanged into Stages 1-4 since those stages reuse this analysis/backtest/report loop as-is.
+- `runs/<run_id>/` contains `config.json`, `dataset_manifest.json`, and `observation_set_manifest.json`
+  alongside `reports/` and `charts/`, per the spec's Stored Data section; `run_id` itself defaults to
+  `config.run_id` but can be overridden per invocation with `--run-id` so a `backtest --cost-bps` rerun
+  can be compared against the original run instead of overwriting it — see design.md's 2026-07-10
+  decisions.
+- `BacktestMetrics` reports long and short sides separately as well as combined, and
+  `NewsSignalObservation` carries `extreme_sentiment` alongside `mean_sentiment`, `weighted_sentiment`,
+  and `sentiment_dispersion` — both were audit gaps against the spec's Backtest Rules and Main Research
+  Dataset sections, closed by design.md's 2026-07-10 decisions.
 
 Type consistency:
 

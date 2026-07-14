@@ -1,0 +1,751 @@
+<title>Correlation-First Pipeline — Design Review</title>
+
+<style>
+  :root {
+    --paper: #f4f5f7;
+    --paper-raised: #ffffff;
+    --ink: #1c222b;
+    --ink-soft: #3a4250;
+    --slate: #5b6472;
+    --slate-faint: #838d9c;
+    --line: #d8dbe1;
+    --line-soft: #e6e8ec;
+    --brass: #a8752b;
+    --brass-soft: #f1e3cd;
+    --accepted: #2f7d6b;
+    --accepted-soft: #e2f0ec;
+    --open: #b5502f;
+    --open-soft: #f5e5df;
+    --shadow: 0 1px 2px rgba(28, 34, 43, 0.06), 0 8px 24px -12px rgba(28, 34, 43, 0.18);
+
+    --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "SF Mono", "IBM Plex Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14181f;
+      --paper-raised: #1b212b;
+      --ink: #e8eaee;
+      --ink-soft: #c3c9d2;
+      --slate: #9aa3b2;
+      --slate-faint: #6d7686;
+      --line: #2a303b;
+      --line-soft: #232933;
+      --brass: #d6a354;
+      --brass-soft: #362a17;
+      --accepted: #55b79c;
+      --accepted-soft: #172b26;
+      --open: #e08462;
+      --open-soft: #33201a;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #14181f;
+    --paper-raised: #1b212b;
+    --ink: #e8eaee;
+    --ink-soft: #c3c9d2;
+    --slate: #9aa3b2;
+    --slate-faint: #6d7686;
+    --line: #2a303b;
+    --line-soft: #232933;
+    --brass: #d6a354;
+    --brass-soft: #362a17;
+    --accepted: #55b79c;
+    --accepted-soft: #172b26;
+    --open: #e08462;
+    --open-soft: #33201a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  }
+  :root[data-theme="light"] {
+    --paper: #f4f5f7;
+    --paper-raised: #ffffff;
+    --ink: #1c222b;
+    --ink-soft: #3a4250;
+    --slate: #5b6472;
+    --slate-faint: #838d9c;
+    --line: #d8dbe1;
+    --line-soft: #e6e8ec;
+    --brass: #a8752b;
+    --brass-soft: #f1e3cd;
+    --accepted: #2f7d6b;
+    --accepted-soft: #e2f0ec;
+    --open: #b5502f;
+    --open-soft: #f5e5df;
+    --shadow: 0 1px 2px rgba(28, 34, 43, 0.06), 0 8px 24px -12px rgba(28, 34, 43, 0.18);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--brass); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--brass);
+    outline-offset: 2px;
+  }
+
+  code, .mono {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  code {
+    background: var(--line-soft);
+    border-radius: 4px;
+    padding: 0.1em 0.4em;
+  }
+
+  h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; color: var(--ink); }
+
+  /* ---------- status bar ---------- */
+
+  .statusbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1.5rem;
+    padding: 0.7rem 2rem;
+    background: var(--paper-raised);
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+  }
+
+  .statusbar .doc-name {
+    font-family: var(--font-mono);
+    color: var(--slate-faint);
+    margin-right: auto;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    padding: 0.22em 0.7em;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .pill.phase-active { background: var(--brass-soft); color: var(--brass); }
+  .pill::before { content: ""; width: 0.5em; height: 0.5em; border-radius: 999px; background: currentColor; }
+
+  /* ---------- header ---------- */
+
+  header.hero {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.75rem 2.5rem;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--slate);
+  }
+
+  h1.title {
+    font-size: clamp(1.9rem, 4vw, 2.5rem);
+    line-height: 1.15;
+    margin: 0.5rem 0 0.9rem;
+  }
+
+  .dek {
+    font-size: 1.05rem;
+    color: var(--ink-soft);
+    max-width: 42rem;
+  }
+
+  .dek b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- generic section shell ---------- */
+
+  section {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 2.25rem 1.75rem;
+  }
+
+  section.wide { max-width: 62rem; }
+
+  section + section { border-top: 1px solid var(--line-soft); }
+
+  h2.section-title {
+    font-size: 1.05rem;
+    letter-spacing: 0.01em;
+    margin: 0 0 1.1rem;
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+
+  h2.section-title .count {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 400;
+    color: var(--slate-faint);
+  }
+
+  p { margin: 0 0 1rem; }
+  p:last-child { margin-bottom: 0; }
+
+  ul.plain { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.65rem; }
+  ul.plain li { padding-left: 1.15rem; position: relative; }
+  ul.plain li::before {
+    content: "—";
+    position: absolute;
+    left: 0;
+    color: var(--slate-faint);
+  }
+
+  /* ---------- reflective inquiry grid ---------- */
+
+  .inquiry-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem 2rem;
+  }
+
+  .inquiry-block h3 {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--slate);
+    font-weight: 600;
+    margin: 0 0 0.6rem;
+  }
+
+  .phase-ledger { display: grid; gap: 0.5rem; }
+  .phase-row { display: flex; gap: 0.6rem; align-items: baseline; font-size: 0.92rem; }
+  .phase-row .tag {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--slate-faint);
+    min-width: 6.4rem;
+    flex-shrink: 0;
+  }
+  .phase-row.is-active .tag { color: var(--brass); font-weight: 700; }
+  .phase-row span.text { color: var(--ink-soft); }
+  .phase-row.is-active span.text { color: var(--ink); font-weight: 600; }
+
+  /* ---------- scope columns ---------- */
+
+  .scope-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem 2rem;
+  }
+
+  .scope-grid h3 {
+    font-size: 0.85rem;
+    margin: 0 0 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .scope-grid h3.in::before { content: ""; width: 0.55em; height: 0.55em; border-radius: 999px; background: var(--accepted); flex-shrink: 0; }
+  .scope-grid h3.out::before { content: ""; width: 0.55em; height: 0.55em; border-radius: 999px; background: var(--slate-faint); flex-shrink: 0; }
+
+  /* ---------- terminology table ---------- */
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+
+  table.terms { width: 100%; border-collapse: collapse; font-size: 0.9rem; min-width: 34rem; }
+  table.terms th, table.terms td { text-align: left; padding: 0.65rem 1rem; vertical-align: top; }
+  table.terms thead th {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--slate);
+    background: var(--paper-raised);
+    border-bottom: 1px solid var(--line);
+  }
+  table.terms tbody tr + tr td { border-top: 1px solid var(--line-soft); }
+  table.terms td.term code { white-space: nowrap; }
+  table.terms td.note { color: var(--slate); font-size: 0.86em; }
+
+  /* ---------- decisions ledger ---------- */
+
+  .ledger-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 1.4rem;
+  }
+
+  .ledger-controls button {
+    font-family: var(--font-body);
+    font-size: 0.82rem;
+    font-weight: 600;
+    padding: 0.4rem 0.9rem;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--paper-raised);
+    color: var(--slate);
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+  .ledger-controls button[aria-pressed="true"] {
+    border-color: var(--brass);
+    color: var(--brass);
+    background: var(--brass-soft);
+  }
+  .ledger-controls button:hover { border-color: var(--slate); }
+  @media (prefers-reduced-motion: reduce) { .ledger-controls button { transition: none; } }
+
+  .batch-heading {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin: 2rem 0 0.9rem;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--slate);
+  }
+  .batch-heading:first-of-type { margin-top: 0; }
+  .batch-heading .line { flex: 1; height: 1px; background: var(--line); }
+
+  .decision-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accepted);
+    border-radius: 10px;
+    padding: 1.1rem 1.3rem;
+    margin-bottom: 0.9rem;
+    box-shadow: var(--shadow);
+  }
+
+  .decision-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem 0.9rem;
+    margin-bottom: 0.55rem;
+  }
+
+  .decision-head .date { font-family: var(--font-mono); font-size: 0.76rem; color: var(--slate-faint); }
+  .decision-head .status-pill {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accepted);
+    background: var(--accepted-soft);
+    padding: 0.15em 0.55em;
+    border-radius: 4px;
+  }
+
+  .decision-text { font-size: 0.98rem; color: var(--ink); margin-bottom: 0.75rem; }
+  .decision-text code { font-size: 0.85em; }
+
+  .decision-meta {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: 0.9rem 1.5rem;
+    font-size: 0.87rem;
+  }
+
+  .decision-meta dt {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--slate);
+    margin-bottom: 0.25rem;
+  }
+
+  .decision-meta dd { margin: 0; color: var(--ink-soft); }
+  .decision-meta dd.links { font-family: var(--font-mono); font-size: 0.82em; color: var(--slate); }
+
+  /* ---------- open questions ---------- */
+
+  .question-card {
+    background: var(--open-soft);
+    border: 1px solid color-mix(in srgb, var(--open) 35%, var(--line));
+    border-radius: 10px;
+    padding: 1.1rem 1.3rem;
+  }
+  .question-card .q { font-weight: 600; margin-bottom: 0.6rem; color: var(--ink); }
+  .question-card dl { display: grid; gap: 0.5rem; margin: 0; font-size: 0.88rem; }
+  .question-card dt { font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--open); display: inline; }
+  .question-card dd { display: inline; margin: 0 0 0 0.4em; color: var(--ink-soft); }
+  .question-card .row { margin-bottom: 0.3rem; }
+
+  /* ---------- artifacts ---------- */
+
+  .artifact-list { display: grid; gap: 0.75rem; }
+  .artifact-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+  .artifact-item .kind {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--slate-faint);
+    min-width: 5.5rem;
+  }
+  .artifact-item code { word-break: break-all; }
+
+  footer {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 2rem 1.75rem 4rem;
+    font-size: 0.8rem;
+    color: var(--slate-faint);
+    border-top: 1px solid var(--line-soft);
+  }
+
+  @media (max-width: 640px) {
+    .inquiry-grid, .scope-grid { grid-template-columns: 1fr; }
+    header.hero, section { padding-left: 1.25rem; padding-right: 1.25rem; }
+    .statusbar { padding: 0.7rem 1.25rem; }
+  }
+</style>
+
+<div class="statusbar">
+  <span class="doc-name">design/correlation-first-pipeline/design.md</span>
+  <span class="pill phase-active">Development Handoff</span>
+  <span class="mono" style="color: var(--slate);">11 decisions · 1 open question</span>
+</div>
+
+<header class="hero">
+  <div class="eyebrow">Design Review · Living Document</div>
+  <h1 class="title">Correlation-First Market Sentiment Pipeline</h1>
+  <p class="dek">
+    A local, rerunnable pipeline testing whether historical news sentiment
+    predicts subsequent U.S. equity/ETF returns — on a zero-dollar vendor
+    budget, with a frozen two-year free-data window. This page supersedes the
+    frozen spec and dated plans as the source of truth for terminology and
+    cross-cutting decisions. <b>Specs and plans stay dated and unedited</b> as
+    historical record; what changed after they were written lives here.
+  </p>
+</header>
+
+<section aria-labelledby="inquiry-title">
+  <h2 class="section-title" id="inquiry-title">Reflective Inquiry</h2>
+  <div class="inquiry-grid">
+    <div class="inquiry-block">
+      <h3>Known</h3>
+      <ul class="plain">
+        <li>Spec's objective, free data sources, architecture, data flow, and V1 fixed decisions are approved and internally coherent.</li>
+        <li>The Stage 0 fixture plan is a fully coded, task-by-task implementation plan — not yet executed. The repo has only an untracked <code>cargo init</code> scaffold.</li>
+        <li><code>run_id</code> names one configuration's result, and the plan's research loop is reused unchanged by every later stage — so whatever grain Stage 0 bakes in becomes permanent.</li>
+        <li>Two audit passes are complete: a manual audit (6 gaps, all resolved) and an adversarial workflow round (4 more durable gaps + several plan-local defects, all resolved).</li>
+      </ul>
+    </div>
+    <div class="inquiry-block">
+      <h3>Unknown</h3>
+      <ul class="plain">
+        <li>Whether a 1-year development / 1-year holdout split is sufficient for an initial go/no-go, and whether the stop/revise/continue gates are strong enough to act on. Flagged by the prior design review, never explicitly answered — deliberately deferred until Stage 0/2 mechanics are proven.</li>
+      </ul>
+    </div>
+    <div class="inquiry-block">
+      <h3>Current Phase</h3>
+      <div class="phase-ledger">
+        <div class="phase-row is-active"><span class="tag">Active</span><span class="text">Development Handoff — resolved gaps confirmed; awaiting sign-off to implement.</span></div>
+        <div class="phase-row"><span class="tag">Satisfied</span><span class="text">Describe, Diagnose, Delimit, Direction, Design.</span></div>
+        <div class="phase-row"><span class="tag">Later</span><span class="text">Direction/Design for Stages 1–4; the holdout question before Stage 3.</span></div>
+        <div class="phase-row"><span class="tag">N/A</span><span class="text">None identified yet.</span></div>
+      </div>
+    </div>
+    <div class="inquiry-block">
+      <h3>Next</h3>
+      <ul class="plain">
+        <li>Confirm with the user whether the corrected Stage 0 plan is settled enough to hand off to implementation.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="problem-title">
+  <h2 class="section-title" id="problem-title">Description &amp; Problem Statement</h2>
+  <p>
+    Build a local, rerunnable research pipeline that determines whether
+    historical news sentiment contains useful out-of-sample information about
+    subsequent U.S. equity and ETF returns, without live trading, on a zero
+    vendor budget, using a frozen two-year free-data window (one development
+    year, one untouched holdout year).
+  </p>
+  <p style="color: var(--ink-soft); font-style: italic;">
+    A researcher cannot determine whether news sentiment has tradable
+    predictive value for U.S. equities/ETFs because no rerunnable,
+    leakage-controlled, cost-aware pipeline exists to test that cheaply,
+    within a zero-dollar vendor budget and a two-year free-data history
+    ceiling.
+  </p>
+</section>
+
+<section aria-labelledby="scope-title">
+  <h2 class="section-title" id="scope-title">Scope</h2>
+  <div class="scope-grid">
+    <div>
+      <h3 class="in">In scope</h3>
+      <ul class="plain">
+        <li>Fixture-first → curated-sample → narrow free-source probe → full two-year hypothesis test (Stages 0–3).</li>
+        <li>Deterministic local sentiment scoring, symmetric long/short/flat rules, immutable dataset/observation lineage, decision-oriented reports.</li>
+      </ul>
+    </div>
+    <div>
+      <h3 class="out">Out of scope (V1 non-goals)</h3>
+      <ul class="plain">
+        <li>Live trading or brokerage execution, interactive dashboards, tick-level data, futures/options/exact benchmark-index feeds, portfolio optimization, supervised/deep-learning models, mandatory social-media ingestion, production-grade proof across many market regimes.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="wide" aria-labelledby="terms-title">
+  <h2 class="section-title" id="terms-title">Working Terminology <span class="count">canonical from here forward</span></h2>
+  <div class="table-scroll">
+    <table class="terms">
+      <thead>
+        <tr><th style="width: 13rem;">Term</th><th>Meaning</th><th style="width: 16rem;">Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="term"><code>news_window</code></td><td>Historical articles included in a signal (trailing 1h, trailing 4h, session-to-now).</td><td class="note"></td></tr>
+        <tr><td class="term"><code>signal_time</code></td><td>Time at which an aggregated signal is available for analysis or trading.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>measurement_horizon</code></td><td>Future market period measured after <code>signal_time</code>.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>price_interval</code></td><td>OHLCV bar duration.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>source_set</code></td><td>Configured source mixture used to create an observation (<code>finance_only</code>, <code>broad_news</code>, <code>finance_plus_broad</code>).</td><td class="note"></td></tr>
+        <tr><td class="term"><code>dataset_id</code></td><td>Immutable identifier for a versioned input snapshot.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>observation_set_id</code></td><td>Immutable identifier for observations derived from one dataset and one aggregation configuration.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>run_id</code></td><td>Identifier for <b>one</b> analysis or backtest configuration and result.</td><td class="note">Decision 1 — singular by design, never blended.</td></tr>
+        <tr><td class="term"><code>configuration</code></td><td>One <code>(news_window, measurement_horizon, source_set)</code> triple (and, within backtest, one cost/threshold pair).</td><td class="note">Names the grain that must not be pooled.</td></tr>
+        <tr><td class="term"><code>available_at</code></td><td>Time Stage 0 allows a signal to use an article. Equals <code>published_at</code> for regular-hours articles; deferred to the next regular-session signal time otherwise.</td><td class="note"></td></tr>
+        <tr><td class="term"><code>entry_time</code></td><td>Equals <code>signal_time</code> — the open of the tradable bar at or after every eligible article's <code>available_at</code>.</td><td class="note">Decision 4 — satisfies no-lookahead without a separate following bar.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section aria-labelledby="direction-title">
+  <h2 class="section-title" id="direction-title">Current Direction</h2>
+  <p>
+    Staged delivery, per the spec: <b>Stage 0</b> (deterministic fixture
+    pipeline) → Stage 1 (hand-curated real sample) → Stage 2 (narrow
+    Massive/GDELT/Alpaca probe) → Stage 3 (free two-year hypothesis test) →
+    Stage 4 (paid history/modeling only if Stage 3 justifies it). Stage 0 is
+    planned in full; Stages 1–4 are named but not yet planned in detail.
+  </p>
+</section>
+
+<section class="wide" aria-labelledby="decisions-title">
+  <h2 class="section-title" id="decisions-title">Decisions <span class="count">11 accepted, 0 tentative</span></h2>
+  <div class="ledger-controls" role="group" aria-label="Filter decisions by review pass">
+    <button type="button" data-filter="all" aria-pressed="true">All passes</button>
+    <button type="button" data-filter="r1" aria-pressed="false">Round 1 · manual audit</button>
+    <button type="button" data-filter="r2" aria-pressed="false">Round 2 · adversarial workflow</button>
+  </div>
+
+  <div class="batch-heading" data-batch="r1">Round 1 — manual audit · 2026-07-09<span class="line"></span></div>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>analysis.rs</code>, <code>backtest.rs</code>, and <code>report.rs</code> must operate per <code>configuration</code> (<code>news_window</code> × <code>measurement_horizon</code> × <code>source_set</code>) — never pooled.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>The spec defines <code>run_id</code> as one configuration's result, and the plan states later stages reuse this loop unchanged — pooling here would defeat the First Experiment Matrix's purpose of comparing configurations.</dd></div>
+      <div><dt>Consequences</dt><dd>Reworked Tasks 7–9: per-configuration thresholds and trade streams, one recommendation per configuration instead of one blended verdict.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Tasks 7–9</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>calendar.rs</code> computes NYSE open/close in America/New_York local time via <code>chrono-tz</code> and converts to UTC per date; <code>regular_close</code> honors <code>early_closes</code>.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>Stage 2/3 ingest a real two-year window that crosses the US DST boundary twice a year — a fixed-UTC calendar would misclassify session status for roughly half of any real dataset.</dd></div>
+      <div><dt>Consequences</dt><dd>Reworked Task 2, threaded <code>early_closes</code> through call sites, added DST-crossing and early-close tests.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Task 2</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>build_one</code> sums contiguous price bars across <code>signal_time</code>→<code>exit_time</code> for horizons wider than one <code>price_interval</code>, and drops (not truncates) any horizon a gap prevents from being fully covered.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>The spec's experiment matrix needs horizons like "next four hours" over one-hour bars — the exact-single-bar-match design silently produced zero observations instead.</dd></div>
+      <div><dt>Consequences</dt><dd>Reworked Task 6; added a test proving a 240-minute horizon aggregates 4 bars mid-session and is dropped near close.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Task 6</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>entry_time == signal_time</code> is correct and intentional — the spec's phrase "enter at the next tradable bar after signal_time" is imprecise, not the implementation.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd><code>available_at &lt;= signal_time == entry_time</code> already guarantees no lookahead. A literal "next bar" reading would be an undocumented, unnecessary latency assumption.</dd></div>
+      <div><dt>Consequences</dt><dd>Spec left unedited (frozen/historical); this entry is the canonical wording. Added a dedicated no-lookahead test to Task 6.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Task 6</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>is_after_hours_signal</code> and <code>market_session</code> are computed per observation, not hardcoded.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>The fixture deliberately includes an after-hours article to exercise this path; hardcoding to <code>false</code>/<code>"regular"</code> discarded that scenario silently.</dd></div>
+      <div><dt>Consequences</dt><dd>Task 6 now computes both fields; the after-hours test asserts the deferred article's observation flips <code>is_after_hours_signal</code> true.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Task 6</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text">Stage 0 intentionally implements only 2 of the spec's 5 decision values and 1 of its 4 baselines. The full sets are a gate before Stage 2/3, not a Stage 0 deliverable.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>Stage 0's own scope never asked for a real verdict — only proof the mechanics work on synthetic data, which has no data-quality signal to justify <code>expand data</code>/<code>expand sources</code>.</dd></div>
+      <div><dt>Consequences</dt><dd>Scope section rewritten to state this explicitly as a gate, replacing a stale line implying the full vocabulary already existed.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Scope</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r1">
+    <div class="decision-head"><span class="date mono">2026-07-09</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text">No action needed — <code>run_all</code>'s hardcoded <code>cost_bps = 5.0</code> was already replaced by <code>config.costs_bps.first()</code> as a byproduct of the configuration-grain rework.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>Flagged during audit, found already fixed by Decision 1's rework of <code>run_all</code>.</dd></div>
+      <div><dt>Consequences</dt><dd>None.</dd></div>
+      <div><dt>Links</dt><dd class="links"><code>run_all</code></dd></div>
+    </dl>
+  </article>
+
+  <div class="batch-heading" data-batch="r2">Round 2 — adversarial workflow review · 2026-07-10<span class="line"></span></div>
+
+  <article class="decision-card" data-batch="r2">
+    <div class="decision-head"><span class="date mono">2026-07-10</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>run</code>, <code>analyze</code>, and <code>backtest</code> accept an optional <code>--run-id</code> override (default: <code>config.run_id</code>) naming the <code>runs/&lt;run_id&gt;/</code> directory for that invocation.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd><code>run_id</code> was a single static value, so every <code>backtest --cost-bps &lt;n&gt;</code> rerun overwrote the previous cost's reports — silently breaking the spec's Decision Demo "compare both runs" step.</dd></div>
+      <div><dt>Consequences</dt><dd>Tasks 1, 7, 8, 9 now thread an effective <code>run_id</code>; a new CLI test keeps separate reports per <code>--run-id</code>.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Tasks 1, 7–9</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r2">
+    <div class="decision-head"><span class="date mono">2026-07-10</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>runs/&lt;run_id&gt;/</code> also contains <code>config.json</code>, <code>dataset_manifest.json</code>, and <code>observation_set_manifest.json</code>, via a shared <code>write_run_manifests</code> helper.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>The spec's Stored Data section lists these three files under every run — no task wrote them. An audit gap, not a deliberate cut.</dd></div>
+      <div><dt>Consequences</dt><dd><code>write_run_manifests</code> called from <code>run_analyze</code>, <code>run_backtest_command</code>, and <code>run_all</code>; Task 10's expected file listing updated.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Tasks 7–10</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r2">
+    <div class="decision-head"><span class="date mono">2026-07-10</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>BacktestMetrics</code> reports long and short sides separately, in addition to the existing combined fields.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>Spec's Backtest Rules: "report long and short sides separately as well as combined." Only combined sums plus bare counts existed.</dd></div>
+      <div><dt>Consequences</dt><dd>New <code>side_summary</code> helper, a test proving per-side sums reconcile to combined, matching columns in <code>write_summary</code>.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Tasks 2, 8, 9</dd></div>
+    </dl>
+  </article>
+
+  <article class="decision-card" data-batch="r2">
+    <div class="decision-head"><span class="date mono">2026-07-10</span><span class="status-pill">Accepted</span></div>
+    <div class="decision-text"><code>NewsSignalObservation</code> gains <code>extreme_sentiment</code> — the eligible article's sentiment score with the largest absolute value, sign preserved.</div>
+    <dl class="decision-meta">
+      <div><dt>Rationale</dt><dd>Spec's Main Research Dataset section requires "mean, weighted, extreme, and dispersion" sentiment features per row; only three of four existed.</dd></div>
+      <div><dt>Consequences</dt><dd><code>build_one</code> computes it from the eligible-article list already gathered for <code>mean_sentiment</code>.</dd></div>
+      <div><dt>Links</dt><dd class="links">Stage 0 plan · Tasks 2, 6</dd></div>
+    </dl>
+  </article>
+
+  <p style="margin-top: 1.4rem; font-size: 0.88rem; color: var(--slate);">
+    Round 2 also fixed several plan-local defects that didn't need a durable decision:
+    a <code>news_window_uses_available_at_and_excludes_future_articles</code> test whose
+    own fixture data could never satisfy its assertions, a config-validation gap that let
+    <code>run_all</code> index empty configured-value vectors and panic, a hardcoded
+    <code>source_catalog</code> that under-reported the fixture's actual sources, and
+    prose-only helper-refactor guidance in Task 9 that risked a double-printed
+    <code>dataset_id</code>/<code>observation_set_id</code>. A manually-traceable
+    fixture-to-trade test was also added to Task 8, satisfying the spec's Required Tests.
+  </p>
+</section>
+
+<section aria-labelledby="open-title">
+  <h2 class="section-title" id="open-title">Open Questions <span class="count">1</span></h2>
+  <div class="question-card">
+    <div class="q">Is a 1-year development / 1-year holdout split sufficient for an initial go/no-go, and are the stop/revise/continue gates strong enough to act on?</div>
+    <dl>
+      <div class="row"><dt>Blocks</dt><dd>Confidence in Stage 3's result, not Stage 0 implementation.</dd></div>
+      <div class="row"><dt>Resolve</dt><dd>Revisit once Stage 0/2 mechanics are proven; may not need resolution until Stage 3 is planned.</dd></div>
+      <div class="row"><dt>Owner</dt><dd>Open</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section aria-labelledby="artifacts-title">
+  <h2 class="section-title" id="artifacts-title">Supporting Artifacts</h2>
+  <div class="artifact-list">
+    <div class="artifact-item"><span class="kind">Spec</span><code>docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md</code> <span style="color: var(--slate-faint);">— frozen, approved</span></div>
+    <div class="artifact-item"><span class="kind">Plan</span><code>docs/superpowers/plans/2026-07-09-stage-0-fixture-pipeline.md</code> <span style="color: var(--slate-faint);">— corrected, 2 review passes clean</span></div>
+    <div class="artifact-item"><span class="kind">Prior review</span><code>.lavish/correlation-first-pipeline-review.html</code> <span style="color: var(--slate-faint);">— disposable</span></div>
+  </div>
+</section>
+
+<footer>
+  Generated as a fallback HTML review — <code>lavish-axi</code> was not detected
+  on this machine — rendered from
+  <code>docs/superpowers/design/correlation-first-pipeline/design.md</code>,
+  which remains the authoritative, editable source. This page is regenerated,
+  not hand-maintained.
+</footer>
+
+<script>
+  (function () {
+    var buttons = document.querySelectorAll('.ledger-controls button');
+    var cards = document.querySelectorAll('.decision-card');
+    var batchHeadings = document.querySelectorAll('.batch-heading');
+
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        buttons.forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+        btn.setAttribute('aria-pressed', 'true');
+        var filter = btn.getAttribute('data-filter');
+
+        cards.forEach(function (card) {
+          var match = filter === 'all' || card.getAttribute('data-batch') === filter;
+          card.style.display = match ? '' : 'none';
+        });
+        batchHeadings.forEach(function (heading) {
+          var match = filter === 'all' || heading.getAttribute('data-batch') === filter;
+          heading.style.display = match ? '' : 'none';
+        });
+      });
+    });
+  })();
+</script>

@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en" data-theme="corporate">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Correlation-First Market Sentiment Pipeline - Design Review</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      background:
+        radial-gradient(circle at 8% 6%, color-mix(in srgb, var(--color-primary) 9%, transparent) 0, transparent 26rem),
+        linear-gradient(180deg, var(--color-base-200), var(--color-base-100) 28rem);
+    }
+    :where(.grid, .flex, .layout-grid, .layout-flex) > *,
+    :where([style*="display: grid"], [style*="display:grid"], [style*="display: flex"], [style*="display:flex"]) > * {
+      min-width: 0;
+    }
+    :where(p, h1, h2, h3, h4, h5, h6, li, dd, blockquote, figcaption, td, th, .badge, .label) {
+      overflow-wrap: anywhere;
+    }
+    :where(img, svg, video, canvas, iframe) {
+      max-width: 100%;
+      height: auto;
+    }
+    .review-section {
+      scroll-margin-top: 1.5rem;
+    }
+    .section-kicker {
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .paper-grid {
+      background-image:
+        linear-gradient(color-mix(in srgb, var(--color-base-content) 4%, transparent) 1px, transparent 1px),
+        linear-gradient(90deg, color-mix(in srgb, var(--color-base-content) 4%, transparent) 1px, transparent 1px);
+      background-size: 22px 22px;
+    }
+    .path {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    .mermaid {
+      display: flex;
+      justify-content: center;
+      min-width: 0;
+      overflow-x: auto;
+      padding: 1rem;
+    }
+    @media print {
+      aside, .no-print { display: none !important; }
+      .page-shell { display: block !important; }
+      .review-section { break-inside: avoid; }
+      body { background: white; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "strict",
+      flowchart: { curve: "basis", htmlLabels: true },
+      themeVariables: {
+        fontFamily: "ui-sans-serif, system-ui, sans-serif",
+        primaryColor: "#e8f2ff",
+        primaryTextColor: "#16324f",
+        primaryBorderColor: "#4b83b8",
+        lineColor: "#5f7082",
+        secondaryColor: "#eef8f3",
+        tertiaryColor: "#fff7df"
+      }
+    });
+  </script>
+</head>
+<body class="min-h-screen text-base-content">
+  <div class="page-shell mx-auto grid max-w-[1500px] grid-cols-1 gap-6 px-4 py-5 lg:grid-cols-[17rem_minmax(0,1fr)] lg:px-8 lg:py-8">
+    <aside class="no-print hidden lg:block">
+      <div class="sticky top-8 rounded-box border border-base-300 bg-base-100/95 p-4 shadow-sm backdrop-blur">
+        <div class="mb-4 border-b border-base-300 pb-4">
+          <p class="section-kicker text-xs font-bold text-primary">Design review</p>
+          <h2 class="mt-2 text-lg font-bold leading-tight">Correlation-first pipeline</h2>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <span class="badge badge-success badge-soft">Approved draft</span>
+            <span class="badge badge-outline">2026-07-08</span>
+          </div>
+        </div>
+        <nav aria-label="Specification sections">
+          <ul class="menu menu-sm w-full gap-1 p-0">
+            <li><a href="#overview">Review brief</a></li>
+            <li><a href="#scope">Goal and scope</a></li>
+            <li><a href="#sources">Free sources</a></li>
+            <li><a href="#architecture">Architecture</a></li>
+            <li><a href="#storage">Data and lineage</a></li>
+            <li><a href="#experiment">Experiment matrix</a></li>
+            <li><a href="#validation">Validation and backtest</a></li>
+            <li><a href="#quality">Quality and tests</a></li>
+            <li><a href="#demo">Decision demo</a></li>
+            <li><a href="#gates">Success gates</a></li>
+            <li><a href="#delivery">Delivery stages</a></li>
+            <li><a href="#glossary">Glossary</a></li>
+          </ul>
+        </nav>
+        <div class="mt-5 rounded-box bg-base-200 p-3 text-xs leading-relaxed">
+          Select any text or element in Lavish to attach review feedback.
+        </div>
+      </div>
+    </aside>
+
+    <main class="min-w-0 space-y-6">
+      <section id="overview" class="review-section hero overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-sm">
+        <div class="hero-content paper-grid w-full max-w-none items-start px-6 py-10 md:px-10 md:py-14">
+          <div class="w-full">
+            <div class="mb-5 flex flex-wrap items-center gap-2">
+              <span class="badge badge-primary badge-soft">Implementation design</span>
+              <span class="badge badge-success badge-soft">Free-first</span>
+              <span class="badge badge-outline">Reviewable spec</span>
+            </div>
+            <p class="section-kicker text-sm font-bold text-primary">Market sentiment research</p>
+            <h1 class="mt-3 max-w-5xl pb-2 text-4xl font-black leading-[1.15] tracking-tight md:text-6xl">
+              Can news sentiment predict profitable trades?
+            </h1>
+            <p class="mt-5 max-w-4xl text-lg leading-relaxed text-base-content/75 md:text-xl">
+              A local, rerunnable pipeline to prove or falsify whether historical news sentiment
+              predicts subsequent U.S. equity and ETF returns after timing constraints, baselines,
+              costs, and an untouched holdout.
+            </p>
+
+            <div class="mt-8 grid w-full grid-cols-1 overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-sm sm:grid-cols-2 xl:grid-cols-4">
+              <div class="min-w-0 border-b border-base-300 p-5 sm:border-r xl:border-b-0">
+                <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Vendor budget</p>
+                <p class="mt-2 text-3xl font-black text-primary">$0</p>
+                <p class="mt-1 text-xs text-base-content/65">Massive, GDELT, Alpaca free tiers</p>
+              </div>
+              <div class="min-w-0 border-b border-base-300 p-5 xl:border-b-0 xl:border-r">
+                <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Research window</p>
+                <p class="mt-2 text-3xl font-black text-primary">2 years</p>
+                <p class="mt-1 text-xs text-base-content/65">1 year development + 1 year holdout</p>
+              </div>
+              <div class="min-w-0 border-b border-base-300 p-5 sm:border-b-0 sm:border-r">
+                <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Initial universe</p>
+                <p class="mt-2 text-3xl font-black text-primary">4 + 25</p>
+                <p class="mt-1 text-xs text-base-content/65">ETFs plus liquid large-cap equities</p>
+              </div>
+              <div class="min-w-0 p-5">
+                <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Primary interval</p>
+                <p class="mt-2 text-3xl font-black text-primary">1 hour</p>
+                <p class="mt-1 text-xs text-base-content/65">15-minute secondary, daily baseline</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="review-section rounded-box border border-warning/35 bg-warning/10 p-5 md:p-6">
+        <div class="flex flex-col gap-4 md:flex-row md:items-start">
+          <div class="badge badge-warning badge-soft shrink-0">Review first</div>
+          <div>
+            <h2 class="text-xl font-bold">Three questions determine whether this design is ready</h2>
+            <ol class="mt-3 grid gap-3 text-sm leading-relaxed md:grid-cols-3">
+              <li class="rounded-box bg-base-100 p-4 shadow-sm">
+                <strong class="block text-base">1. Credibility</strong>
+                Is a one-year untouched holdout enough for an initial go/no-go decision?
+              </li>
+              <li class="rounded-box bg-base-100 p-4 shadow-sm">
+                <strong class="block text-base">2. Leakage control</strong>
+                Do the timestamp, next-bar, source, and observation rules prevent future information?
+              </li>
+              <li class="rounded-box bg-base-100 p-4 shadow-sm">
+                <strong class="block text-base">3. Decision value</strong>
+                Are the stop, revise, and continue gates strong enough to guide the next investment?
+              </li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <section id="scope" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body gap-6 p-6 md:p-8">
+          <div>
+            <p class="section-kicker text-xs font-bold text-primary">01 / intent</p>
+            <h2 class="mt-2 text-3xl font-black">Goal and scope boundary</h2>
+          </div>
+
+          <div class="grid gap-5 lg:grid-cols-2">
+            <article class="rounded-box border border-success/30 bg-success/8 p-5">
+              <span class="badge badge-success badge-soft">V1 must prove</span>
+              <h3 class="mt-4 text-xl font-bold">Usable out-of-sample signal</h3>
+              <p class="mt-2 leading-relaxed text-base-content/75">
+                The design must go beyond correlation. A moderately realistic long/short/flat rule
+                must remain interesting after next-bar execution, costs, controls, and a frozen holdout.
+              </p>
+            </article>
+            <article class="rounded-box border border-error/25 bg-error/6 p-5">
+              <span class="badge badge-error badge-soft">V1 does not claim</span>
+              <h3 class="mt-4 text-xl font-bold">Production trading readiness</h3>
+              <p class="mt-2 leading-relaxed text-base-content/75">
+                Two years can justify more research, but cannot prove robustness across many market
+                regimes or support live brokerage execution.
+              </p>
+            </article>
+          </div>
+
+          <div>
+            <h3 class="text-lg font-bold">Fixed decisions</h3>
+            <div class="mt-3 overflow-x-auto rounded-box border border-base-300">
+              <table class="table table-zebra">
+                <thead>
+                  <tr>
+                    <th>Decision</th>
+                    <th>V1 choice</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="font-semibold">Budget</td>
+                    <td><span class="badge badge-success badge-soft">$0 vendors</span></td>
+                    <td>Prove acquisition and signal before paying for history.</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Text</td>
+                    <td>Headline + summary</td>
+                    <td>Available legally and consistently from affordable feeds.</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Sentiment</td>
+                    <td>Deterministic local scorer</td>
+                    <td>Explainable, versioned, and free to rerun.</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Strategy</td>
+                    <td>Long / short / flat</td>
+                    <td>Tests positive and negative sentiment symmetrically.</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Storage</td>
+                    <td>JSONL + Parquet + report files</td>
+                    <td>Immutable raw data with efficient reusable analysis.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="rounded-box bg-base-200 p-5">
+            <h3 class="font-bold">Explicit non-goals</h3>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <span class="badge badge-outline">Live trading</span>
+              <span class="badge badge-outline">Interactive dashboard</span>
+              <span class="badge badge-outline">Tick data</span>
+              <span class="badge badge-outline">Futures and options</span>
+              <span class="badge badge-outline">Portfolio optimization</span>
+              <span class="badge badge-outline">Supervised ML</span>
+              <span class="badge badge-outline">Mandatory social data</span>
+              <span class="badge badge-outline">Production-grade proof</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="sources" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">02 / acquisition</p>
+          <div class="mt-2 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h2 class="text-3xl font-black">Free data source plan</h2>
+              <p class="mt-2 max-w-3xl text-base-content/70">
+                Source quality remains an experiment variable. Stage 2 measures coverage, timestamps,
+                duplication, and publisher diversity before the full two-year run.
+              </p>
+            </div>
+            <span class="badge badge-success badge-soft h-auto min-h-0 whitespace-normal px-3 py-2 text-center">Expected vendor cost: $0</span>
+          </div>
+
+          <div class="mt-6 overflow-x-auto rounded-box border border-base-300">
+            <table class="table table-zebra">
+              <thead>
+                <tr>
+                  <th>Role</th>
+                  <th>Source</th>
+                  <th>Free coverage</th>
+                  <th>Fields / value</th>
+                  <th>Primary caveat</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><span class="badge badge-primary badge-soft">Finance news</span></td>
+                  <td class="font-bold">Massive Stocks Basic</td>
+                  <td>Two years, hourly updates</td>
+                  <td>Title, description, publisher, URL, ticker tags, UTC publication time</td>
+                  <td>Coverage and publisher mix must be measured.</td>
+                </tr>
+                <tr>
+                  <td><span class="badge badge-secondary badge-soft">Broad news</span></td>
+                  <td class="font-bold">GDELT</td>
+                  <td>Free and open</td>
+                  <td>Macro, rates, housing, policy, geopolitics, sectors, themes</td>
+                  <td>Large, noisy dataset; prefer direct downloads over paid BigQuery use.</td>
+                </tr>
+                <tr>
+                  <td><span class="badge badge-accent badge-soft">Market prices</span></td>
+                  <td class="font-bold">Alpaca Basic</td>
+                  <td>U.S. history since 2016</td>
+                  <td>Stock and ETF OHLCV bars; 200 historical requests per minute</td>
+                  <td>Source probe must verify interval completeness.</td>
+                </tr>
+                <tr>
+                  <td><span class="badge badge-ghost">Deferred</span></td>
+                  <td class="font-bold">X / paid social feeds</td>
+                  <td>Not included</td>
+                  <td>Potential fast-moving sentiment and rumor diffusion</td>
+                  <td>Historical depth, pricing, licensing, and access are unverified.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="mt-5 grid gap-4 md:grid-cols-3">
+            <a class="card card-border bg-base-200 transition hover:border-primary" href="https://massive.com/docs/rest/stocks/news" target="_blank" rel="noreferrer">
+              <div class="card-body p-4">
+                <h3 class="card-title text-base">Massive news docs</h3>
+                <p class="text-sm text-base-content/65">Ticker-focused finance news endpoint.</p>
+              </div>
+            </a>
+            <a class="card card-border bg-base-200 transition hover:border-primary" href="https://www.gdeltproject.org/data.html" target="_blank" rel="noreferrer">
+              <div class="card-body p-4">
+                <h3 class="card-title text-base">GDELT data</h3>
+                <p class="text-sm text-base-content/65">Broad global event and theme coverage.</p>
+              </div>
+            </a>
+            <a class="card card-border bg-base-200 transition hover:border-primary" href="https://docs.alpaca.markets/us/v1.1/docs/about-market-data-api" target="_blank" rel="noreferrer">
+              <div class="card-body p-4">
+                <h3 class="card-title text-base">Alpaca market data</h3>
+                <p class="text-sm text-base-content/65">Historical U.S. equity and ETF bars.</p>
+              </div>
+            </a>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">03 / system</p>
+          <h2 class="mt-2 text-3xl font-black">Architecture and data flow</h2>
+          <p class="mt-2 max-w-3xl text-base-content/70">
+            Vendor adapters feed stable normalized schemas. Immutable source snapshots and reusable
+            observation sets let analyses change without downloading the data again.
+          </p>
+
+          <div class="mt-6 rounded-box border border-base-300 bg-base-200/60 p-2">
+            <div class="mermaid">
+flowchart TD
+  A["fixture / Massive / GDELT / Alpaca"] --> B["ingest<br/>immutable raw payloads"]
+  B --> C["normalize<br/>canonical articles and price bars"]
+  C --> D["score<br/>sentiment + market relevance"]
+  D --> E["build-observations<br/>time-safe signal alignment"]
+  E --> F[("observation_set_id<br/>reusable Parquet")]
+  F --> G["analyze<br/>correlation, buckets, lag, tail"]
+  F --> H["backtest<br/>long / short / flat + costs"]
+  G --> I["report<br/>decision tables and charts"]
+  H --> I
+  J[("dataset_id<br/>immutable source snapshot")] -. lineage .-> C
+  J -. source .-> F
+  I --> K["stop / revise / expand / continue"]
+            </div>
+          </div>
+
+          <div class="mt-6">
+            <h3 class="text-lg font-bold">CLI stages</h3>
+            <ul class="steps steps-vertical mt-4 w-full lg:steps-horizontal">
+              <li class="step step-primary"><code>fixture</code></li>
+              <li class="step step-primary"><code>ingest</code></li>
+              <li class="step step-primary"><code>normalize</code></li>
+              <li class="step step-primary"><code>score</code></li>
+              <li class="step step-primary"><code>build-observations</code></li>
+              <li class="step"><code>analyze</code></li>
+              <li class="step"><code>backtest</code></li>
+              <li class="step"><code>report</code></li>
+            </ul>
+          </div>
+
+          <div class="mt-6 grid gap-4 md:grid-cols-3">
+            <div class="rounded-box border border-base-300 p-5">
+              <span class="badge badge-primary badge-soft">Reuse</span>
+              <h3 class="mt-3 font-bold">Change thresholds or costs</h3>
+              <p class="mt-2 text-sm text-base-content/70">Rerun only the backtest against the same observation set.</p>
+            </div>
+            <div class="rounded-box border border-base-300 p-5">
+              <span class="badge badge-secondary badge-soft">Rebuild</span>
+              <h3 class="mt-3 font-bold">Change windows or scoring</h3>
+              <p class="mt-2 text-sm text-base-content/70">Regenerate observations from the stored source snapshot.</p>
+            </div>
+            <div class="rounded-box border border-base-300 p-5">
+              <span class="badge badge-accent badge-soft">Snapshot</span>
+              <h3 class="mt-3 font-bold">Add sources or history</h3>
+              <p class="mt-2 text-sm text-base-content/70">Create a new immutable dataset ID with fresh lineage.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="storage" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">04 / lineage</p>
+          <h2 class="mt-2 text-3xl font-black">Data contract and traceability</h2>
+
+          <div class="mt-6 grid gap-4 lg:grid-cols-3">
+            <article class="card card-border bg-base-200">
+              <div class="card-body p-5">
+                <div class="flex items-center justify-between gap-3">
+                  <h3 class="card-title text-lg">Source snapshot</h3>
+                  <span class="badge badge-primary badge-soft h-auto min-h-0 whitespace-normal py-1 text-center">dataset_id</span>
+                </div>
+                <p class="path mt-3 text-xs">data/datasets/&lt;dataset_id&gt;/</p>
+                <ul class="mt-3 space-y-2 text-sm">
+                  <li><code>raw/*.jsonl</code></li>
+                  <li><code>normalized_articles.parquet</code></li>
+                  <li><code>price_bars.parquet</code></li>
+                  <li><code>source_catalog.parquet</code></li>
+                  <li><code>manifest.json</code></li>
+                </ul>
+              </div>
+            </article>
+            <article class="card card-border bg-base-200">
+              <div class="card-body p-5">
+                <div class="flex items-center justify-between gap-3">
+                  <h3 class="card-title text-lg">Derived signals</h3>
+                  <span class="badge badge-secondary badge-soft h-auto min-h-0 whitespace-normal py-1 text-center">observation_set_id</span>
+                </div>
+                <p class="path mt-3 text-xs">data/observation_sets/&lt;id&gt;/</p>
+                <ul class="mt-3 space-y-2 text-sm">
+                  <li><code>news_signal_observations.parquet</code></li>
+                  <li><code>manifest.json</code></li>
+                </ul>
+                <p class="mt-3 text-xs text-base-content/65">
+                  Manifest records source dataset, windows, horizons, scoring and relevance versions,
+                  row count, schema, and checksums.
+                </p>
+              </div>
+            </article>
+            <article class="card card-border bg-base-200">
+              <div class="card-body p-5">
+                <div class="flex items-center justify-between gap-3">
+                  <h3 class="card-title text-lg">Experiment result</h3>
+                  <span class="badge badge-accent badge-soft h-auto min-h-0 whitespace-normal py-1 text-center">run_id</span>
+                </div>
+                <p class="path mt-3 text-xs">runs/&lt;run_id&gt;/</p>
+                <ul class="mt-3 space-y-2 text-sm">
+                  <li><code>config.json</code> + manifests</li>
+                  <li><code>reports/summary.md</code></li>
+                  <li><code>reports/coverage.csv</code></li>
+                  <li><code>reports/backtest_metrics.csv</code></li>
+                  <li><code>reports/trade_log.csv</code></li>
+                  <li><code>charts/</code></li>
+                </ul>
+              </div>
+            </article>
+          </div>
+
+          <div class="mt-6 rounded-box border border-base-300 p-5">
+            <h3 class="text-lg font-bold">Main research row</h3>
+            <p class="path mt-3 rounded-box bg-neutral px-4 py-3 text-sm text-neutral-content">
+              symbol x signal_time x news_window x measurement_horizon x price_interval x source_set
+            </p>
+            <div class="mt-4 overflow-x-auto">
+              <table class="table table-sm table-zebra">
+                <thead>
+                  <tr>
+                    <th>Field group</th>
+                    <th>Representative contents</th>
+                    <th>Decision supported</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="font-semibold">Source</td>
+                    <td>Article counts by scope, source count, publisher count</td>
+                    <td>Coverage and source-diversity tests</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Sentiment</td>
+                    <td>Mean, weighted, extreme counts, dispersion</td>
+                    <td>Direction and tail-signal strength</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Market context</td>
+                    <td>Prior return, prior volatility, session, after-hours flag</td>
+                    <td>Baselines and regime context</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Future measurement</td>
+                    <td>Return, volatility, tail event, max drawdown, max runup</td>
+                    <td>Predictive and economic value</td>
+                  </tr>
+                  <tr>
+                    <td class="font-semibold">Audit</td>
+                    <td>Article IDs, price-bar IDs, dataset and run lineage</td>
+                    <td>Manual tracing and leakage review</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="experiment" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">05 / research</p>
+          <h2 class="mt-2 text-3xl font-black">Bounded first experiment</h2>
+          <p class="mt-2 max-w-3xl text-base-content/70">
+            The matrix is deliberately constrained. Added combinations are exploratory and cannot
+            count as proof unless evaluated on new untouched data.
+          </p>
+
+          <div class="mt-6 overflow-x-auto rounded-box border border-base-300">
+            <table class="table table-zebra">
+              <thead>
+                <tr>
+                  <th>Dimension</th>
+                  <th>Primary values</th>
+                  <th>Secondary / guardrail</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="font-semibold">Universe</td>
+                  <td>SPY, QQQ, DIA, IWM + roughly 25 large caps</td>
+                  <td>Start with 5-10 equities in source probe</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Price interval</td>
+                  <td>1 hour</td>
+                  <td>15 minutes if reliable; daily sanity baseline</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">News window</td>
+                  <td>Trailing 1h, trailing 4h, session-to-now</td>
+                  <td>No new windows until reports are interpretable</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Measurement horizon</td>
+                  <td>Next 1h, next 4h, same-day close, next session</td>
+                  <td>Measured strictly after signal time</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Source set</td>
+                  <td>Finance-only, broad-news, finance-plus-broad</td>
+                  <td>Identical symbols, dates, windows, market data</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Trade threshold</td>
+                  <td>Top/bottom 10% and 20%</td>
+                  <td>Learned on development data, then frozen</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Cost assumptions</td>
+                  <td>0, 5, 10 basis points</td>
+                  <td>Doubled-cost stress test on selected rule</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Baselines</td>
+                  <td>Always-flat, random, shuffled sentiment, momentum</td>
+                  <td>Sentiment must add value beyond controls</td>
+                </tr>
+                <tr>
+                  <td class="font-semibold">Targets</td>
+                  <td>Return, direction, volatility, tail event</td>
+                  <td>Emphasize valuable outliers, not only small moves</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="mt-6 grid gap-4 lg:grid-cols-3">
+            <article class="rounded-box border border-primary/30 bg-primary/8 p-5">
+              <span class="badge badge-primary badge-soft">Ticker-specific</span>
+              <p class="mt-3 text-sm leading-relaxed">Direct company and ETF news linked through vendor tags and entity rules.</p>
+            </article>
+            <article class="rounded-box border border-secondary/30 bg-secondary/8 p-5">
+              <span class="badge badge-secondary badge-soft">Sector / theme</span>
+              <p class="mt-3 text-sm leading-relaxed">Semiconductors, banks, AI, energy, housing, and configured exposure mappings.</p>
+            </article>
+            <article class="rounded-box border border-accent/30 bg-accent/8 p-5">
+              <span class="badge badge-accent badge-soft">Macro-market</span>
+              <p class="mt-3 text-sm leading-relaxed">Rates, inflation, jobs, Fed policy, oil, geopolitics, and broad drivers.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="validation" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">06 / credibility</p>
+          <h2 class="mt-2 text-3xl font-black">Validation and execution realism</h2>
+
+          <div class="mt-6 grid gap-5 lg:grid-cols-2">
+            <article class="rounded-box border border-base-300 p-5">
+              <div class="flex items-center justify-between gap-3">
+                <h3 class="text-xl font-bold">Year 1: development</h3>
+                <span class="badge badge-info badge-soft">Visible</span>
+              </div>
+              <ul class="mt-4 space-y-3 text-sm leading-relaxed">
+                <li>Chronological exploration and walk-forward validation.</li>
+                <li>Select source sets, windows, horizons, and quantile thresholds.</li>
+                <li>Use time-aware uncertainty estimates for correlated intraday rows.</li>
+                <li>Freeze the primary matrix before viewing holdout results.</li>
+              </ul>
+            </article>
+            <article class="rounded-box border border-warning/40 bg-warning/8 p-5">
+              <div class="flex items-center justify-between gap-3">
+                <h3 class="text-xl font-bold">Year 2: final holdout</h3>
+                <span class="badge badge-warning badge-soft">Untouched</span>
+              </div>
+              <ul class="mt-4 space-y-3 text-sm leading-relaxed">
+                <li>Apply frozen thresholds and configuration exactly once.</li>
+                <li>Do not tune against holdout performance.</li>
+                <li>Label later holdout-driven variants exploratory.</li>
+                <li>Require new untouched data before calling those variants proof.</li>
+              </ul>
+            </article>
+          </div>
+
+          <div class="mt-6 rounded-box bg-neutral p-6 text-neutral-content">
+            <h3 class="text-xl font-bold">Backtest contract</h3>
+            <div class="mt-4 grid gap-4 text-sm md:grid-cols-2">
+              <ul class="space-y-2">
+                <li>Enter at the next configured tradable bar.</li>
+                <li>Never trade before the article publication timestamp.</li>
+                <li>Defer after-hours signals to the next regular session.</li>
+                <li>Long upper sentiment quantile; short lower quantile.</li>
+              </ul>
+              <ul class="space-y-2">
+                <li>Remain flat in the middle of the distribution.</li>
+                <li>Report gross and net returns.</li>
+                <li>Apply configured spread/slippage costs.</li>
+                <li>Report long, short, and combined performance.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="quality" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">07 / safeguards</p>
+          <h2 class="mt-2 text-3xl font-black">Data quality, failures, and tests</h2>
+
+          <div class="mt-6 grid gap-5 lg:grid-cols-2">
+            <div>
+              <h3 class="text-lg font-bold">Pipeline safeguards</h3>
+              <div class="mt-3 space-y-3">
+                <div class="alert alert-soft alert-info"><span>Normalize to UTC while retaining original timestamps.</span></div>
+                <div class="alert alert-soft alert-info"><span>Quarantine missing or ambiguous publication times.</span></div>
+                <div class="alert alert-soft alert-info"><span>Deduplicate syndicated and republished articles.</span></div>
+                <div class="alert alert-soft alert-info"><span>Respect holidays, early closes, after-hours, and daylight saving transitions.</span></div>
+                <div class="alert alert-soft alert-warning"><span>Never silently forward-fill missing news or price bars.</span></div>
+                <div class="alert alert-soft alert-error"><span>Mark materially incomplete runs invalid, not merely negative.</span></div>
+              </div>
+            </div>
+            <div>
+              <h3 class="text-lg font-bold">Required test evidence</h3>
+              <div class="mt-3 overflow-hidden rounded-box border border-base-300">
+                <ul class="list bg-base-100">
+                  <li class="list-row"><div><strong>Temporal boundaries</strong><div class="text-xs text-base-content/60">Windows, publication times, next-bar, after-hours</div></div></li>
+                  <li class="list-row"><div><strong>Market calendar</strong><div class="text-xs text-base-content/60">Weekends, holidays, early close, daylight saving</div></div></li>
+                  <li class="list-row"><div><strong>Data correctness</strong><div class="text-xs text-base-content/60">Deduplication, returns, short accounting, costs</div></div></li>
+                  <li class="list-row"><div><strong>Reproducibility</strong><div class="text-xs text-base-content/60">Same snapshot, config, and seed yield same outputs</div></div></li>
+                  <li class="list-row"><div><strong>Traceability</strong><div class="text-xs text-base-content/60">Raw article through signal, price bars, and trade</div></div></li>
+                  <li class="list-row"><div><strong>Controls</strong><div class="text-xs text-base-content/60">Positive, negative, neutral, shuffled, end-to-end fixture</div></div></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-5 alert alert-outline alert-warning">
+            <span>
+              Failed experiments remain first-class artifacts with rate limits, retries, outages,
+              dropped rows, and coverage gaps recorded.
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section id="demo" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">08 / review outcome</p>
+          <h2 class="mt-2 text-3xl font-black">Decision demo</h2>
+          <p class="mt-2 max-w-3xl text-base-content/70">
+            The demo proves the workflow is reusable, not just that one report can be generated.
+          </p>
+
+          <ul class="timeline timeline-vertical mt-6 lg:timeline-horizontal">
+            <li>
+              <div class="timeline-start timeline-box">Ingest once</div>
+              <div class="timeline-middle"><span class="badge badge-primary badge-sm"></span></div>
+              <hr class="bg-primary">
+            </li>
+            <li>
+              <hr class="bg-primary">
+              <div class="timeline-end timeline-box">Run baseline</div>
+              <div class="timeline-middle"><span class="badge badge-primary badge-sm"></span></div>
+              <hr class="bg-primary">
+            </li>
+            <li>
+              <hr class="bg-primary">
+              <div class="timeline-start timeline-box">Inspect charts and trades</div>
+              <div class="timeline-middle"><span class="badge badge-primary badge-sm"></span></div>
+              <hr class="bg-primary">
+            </li>
+            <li>
+              <hr class="bg-primary">
+              <div class="timeline-end timeline-box">Change one assumption</div>
+              <div class="timeline-middle"><span class="badge badge-primary badge-sm"></span></div>
+              <hr class="bg-primary">
+            </li>
+            <li>
+              <hr class="bg-primary">
+              <div class="timeline-start timeline-box">Rerun without download</div>
+              <div class="timeline-middle"><span class="badge badge-primary badge-sm"></span></div>
+              <hr class="bg-primary">
+            </li>
+            <li>
+              <hr class="bg-primary">
+              <div class="timeline-end timeline-box">Compare and decide</div>
+              <div class="timeline-middle"><span class="badge badge-success badge-sm"></span></div>
+            </li>
+          </ul>
+
+          <div class="mt-8 grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+            <div class="min-w-0 rounded-box border border-base-300 p-5">
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Analysis</p>
+              <p class="mt-2 text-2xl font-black">Buckets</p>
+              <p class="mt-1 text-xs text-base-content/65">Correlation, lag, source, tail tests</p>
+            </div>
+            <div class="min-w-0 rounded-box border border-base-300 p-5">
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Trading</p>
+              <p class="mt-2 text-2xl font-black">P&amp;L</p>
+              <p class="mt-1 text-xs text-base-content/65">Gross, net, long, short, combined</p>
+            </div>
+            <div class="min-w-0 rounded-box border border-base-300 p-5">
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Risk</p>
+              <p class="mt-2 text-2xl font-black">Drawdown</p>
+              <p class="mt-1 text-xs text-base-content/65">Costs, stress case, fragile periods</p>
+            </div>
+            <div class="min-w-0 rounded-box border border-base-300 p-5">
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">Decision</p>
+              <p class="mt-2 text-2xl font-black">Next step</p>
+              <p class="mt-1 text-xs text-base-content/65">Stop, revise, expand, continue</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="gates" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">09 / decision gates</p>
+          <h2 class="mt-2 text-3xl font-black">What counts as success or failure?</h2>
+
+          <div class="mt-6 grid gap-5 lg:grid-cols-2">
+            <article class="rounded-box border border-success/35 bg-success/8 p-5">
+              <div class="flex items-center gap-3">
+                <span class="badge badge-success">Promising</span>
+                <h3 class="text-xl font-bold">Continue or expand</h3>
+              </div>
+              <ul class="mt-4 space-y-3 text-sm leading-relaxed">
+                <li>Held-out top-minus-bottom sentiment return spread is positive.</li>
+                <li>Held-out long/short rule is profitable after moderate costs.</li>
+                <li>Selected result remains profitable under doubled costs.</li>
+                <li>Development walk-forward periods show consistent direction.</li>
+                <li>No single symbol, source, week, or event dominates the result.</li>
+                <li>Tail-event prediction improves over non-sentiment baselines.</li>
+                <li>Coverage and timestamp checks pass.</li>
+              </ul>
+            </article>
+            <article class="rounded-box border border-error/35 bg-error/7 p-5">
+              <div class="flex items-center gap-3">
+                <span class="badge badge-error">Stop / revise</span>
+                <h3 class="text-xl font-bold">Do not scale yet</h3>
+              </div>
+              <ul class="mt-4 space-y-3 text-sm leading-relaxed">
+                <li>Coverage is too sparse or publication times are unreliable.</li>
+                <li>Sentiment does no better than shuffled or non-sentiment baselines.</li>
+                <li>The edge disappears under next-bar execution or simple costs.</li>
+                <li>Results depend on one fragile configuration or isolated event.</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="delivery" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">10 / delivery</p>
+          <h2 class="mt-2 text-3xl font-black">Incremental stages</h2>
+          <p class="mt-2 max-w-3xl text-base-content/70">
+            Every stage produces the same lineage, reports, controls, and explicit next decision.
+          </p>
+
+          <div class="mt-6 grid gap-4">
+            <div class="card card-side card-border bg-base-200">
+              <div class="flex w-20 shrink-0 items-center justify-center bg-primary text-2xl font-black text-primary-content">0</div>
+              <div class="card-body p-5">
+                <h3 class="card-title">Deterministic fixture pipeline</h3>
+                <p class="text-sm">Recover known synthetic positive and negative relationships; prove reruns change only intended outputs.</p>
+              </div>
+            </div>
+            <div class="card card-side card-border bg-base-200">
+              <div class="flex w-20 shrink-0 items-center justify-center bg-primary text-2xl font-black text-primary-content">1</div>
+              <div class="card-body p-5">
+                <h3 class="card-title">Hand-curated real sample</h3>
+                <p class="text-sm">Inspect timestamp alignment, after-hours handling, leakage controls, and traceability by hand.</p>
+              </div>
+            </div>
+            <div class="card card-side card-border bg-base-200">
+              <div class="flex w-20 shrink-0 items-center justify-center bg-primary text-2xl font-black text-primary-content">2</div>
+              <div class="card-body p-5">
+                <h3 class="card-title">Narrow free-source probe</h3>
+                <p class="text-sm">Test Massive, GDELT, and Alpaca schemas, coverage, publisher diversity, limits, and missing-data behavior.</p>
+              </div>
+            </div>
+            <div class="card card-side card-border bg-base-200">
+              <div class="flex w-20 shrink-0 items-center justify-center bg-success text-2xl font-black text-success-content">3</div>
+              <div class="card-body p-5">
+                <h3 class="card-title">Free two-year hypothesis test</h3>
+                <p class="text-sm">Freeze the primary experiment on year one, evaluate once on year two, and issue a go/no-go recommendation.</p>
+              </div>
+            </div>
+            <div class="card card-side card-border bg-base-200">
+              <div class="flex w-20 shrink-0 items-center justify-center bg-base-300 text-2xl font-black">4</div>
+              <div class="card-body p-5">
+                <h3 class="card-title">Conditional expansion</h3>
+                <p class="text-sm">Buy more history or add predictive modeling only if Stage 3 survives costs, controls, and holdout validation.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="glossary" class="review-section card card-border bg-base-100 shadow-sm">
+        <div class="card-body p-6 md:p-8">
+          <p class="section-kicker text-xs font-bold text-primary">11 / language</p>
+          <h2 class="mt-2 text-3xl font-black">Core terminology</h2>
+
+          <div class="mt-6 grid gap-4 md:grid-cols-2">
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">news_window</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Historical articles included in a signal, such as trailing one hour or session-to-now.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">signal_time</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Time at which an aggregated signal becomes available for measurement or trading.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">measurement_horizon</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Future market period measured strictly after the signal time.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">price_interval</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Duration of each OHLCV price bar.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">source_set</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Configured mixture of finance, broad, and combined news used for an observation.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">dataset_id</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Immutable identifier for one source-data snapshot.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">observation_set_id</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Immutable identifier for signals derived from one dataset and aggregation configuration.</dd>
+            </dl>
+            <dl class="rounded-box border border-base-300 p-5">
+              <dt class="path font-bold text-primary">run_id</dt>
+              <dd class="mt-2 text-sm text-base-content/70">Identifier for one analysis or backtest configuration and its outputs.</dd>
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <footer class="rounded-box border border-base-300 bg-base-100 p-5 text-sm text-base-content/65">
+        <p>
+          Source specification:
+          <span class="path">docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md</span>
+        </p>
+        <p class="mt-1">Status: approved for implementation planning. This page is a review surface, not a replacement for the committed Markdown source.</p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
