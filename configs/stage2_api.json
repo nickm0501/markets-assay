@@ -1,0 +1,25 @@
+{
+  "run_id": "stage2_api",
+  "output_root": "artifacts",
+  "generated_at": "2026-07-14T00:00:00Z",
+  "news_source": "api",
+  "price_source": "api",
+  "dataset_date_start": "2025-07-01",
+  "dataset_date_end": "2025-07-07",
+  "symbols": ["SPY", "QQQ", "AAPL", "AMZN", "NVDA", "MSFT"],
+  "constituent_etf_map": {
+    "AAPL": ["QQQ", "SPY"], "AMZN": ["QQQ", "SPY"],
+    "NVDA": ["QQQ", "SPY"], "MSFT": ["QQQ", "SPY"]
+  },
+  "source_sets": ["finance_only", "broad_news", "finance_plus_broad"],
+  "news_windows_minutes": [60, 240],
+  "measurement_horizons_minutes": [60],
+  "price_interval_minutes": 60,
+  "long_quantile": 0.8,
+  "short_quantile": 0.2,
+  "costs_bps": [0.0, 5.0, 10.0],
+  "holidays": ["2025-07-04"],
+  "early_closes": { "2025-07-03": "13:00" },
+  "theme_symbol_map": { "markets": ["SPY", "QQQ"] },
+  "macro_symbols": ["SPY", "QQQ"]
+}

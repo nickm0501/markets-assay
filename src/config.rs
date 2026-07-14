@@ -15,6 +15,9 @@ pub enum SourceMode {
     Fixture,
     /// Real vendor payloads read off disk (Stage 1).
     SavedFiles,
+    /// Fetched live from the vendors, with rate limiting, retry and a resumable
+    /// cache (Stage 2). Credentials come from the environment, never from config.
+    Api,
 }
 
 fn default_source_mode() -> SourceMode {
@@ -30,6 +33,10 @@ fn default_seed() -> u64 {
 }
 
 fn default_development_fraction() -> f64 {
+    0.5
+}
+
+fn default_min_coverage() -> f64 {
     0.5
 }
 
@@ -139,6 +146,12 @@ pub struct PipelineConfig {
     /// data and then frozen." 0.5 = the spec's one-year/one-year split.
     #[serde(default = "default_development_fraction")]
     pub development_fraction: f64,
+    /// Minimum share of the configured symbols that must actually produce
+    /// observations. Below this the run is MARKED INVALID and says so — the spec:
+    /// "Mark a run invalid when material coverage gaps violate its configured
+    /// minimum." A report nobody flagged is a report somebody will believe.
+    #[serde(default = "default_min_coverage")]
+    pub min_coverage: f64,
     pub costs_bps: Vec<f64>,
     pub holidays: Vec<NaiveDate>,
     pub early_closes: BTreeMap<NaiveDate, String>,

@@ -9,3 +9,6 @@ artifacts/
 
 # Editor config
 .obsidian/
+
+# Live-API payload cache. Regenerable; do not commit.
+artifacts/cache/

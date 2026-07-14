@@ -120,6 +120,15 @@ fn create_dataset_snapshot(config: &PipelineConfig, root: &Path, dry_run: bool) 
             sources.push(name);
         }
     }
+    // THE INGEST LOG (spec: "Record rate-limit responses, retries, source
+    // outages, dropped rows, and coverage gaps"). Only the API source has one;
+    // fixture and saved-file sources make no requests. At Stage 3 scale — a
+    // multi-hour, rate-limited fetch that WILL be interrupted — this is the only
+    // way to know what you actually have.
+    if let Some(rows) = news.ingest_log().filter(|rows| !rows.is_empty()) {
+        write_csv(&temp_dir.join("ingest_log.csv"), &rows)?;
+    }
+
     let (date_start, date_end) = derive_date_range(&normalized, &price_bars)?;
     let input = DatasetManifestInput {
         created_at: config.generated_at,
@@ -748,8 +757,36 @@ pub fn run_all(
     // commands write (Task 7/8's write_run_manifests) — required by the
     // spec's Stored Data section and asserted by Task 10 Step 6's expected
     // file listing.
+    // COVERAGE GATE (spec: "Mark a run invalid when material coverage gaps
+    // violate its configured minimum"). A run below the floor is NOT deleted —
+    // the spec keeps failed experiments as first-class artifacts, because failure
+    // is data — but it is stamped invalid and its summary says so at the top. A
+    // report nobody flagged is a report somebody will believe.
+    let covered: std::collections::BTreeSet<&str> =
+        observations.iter().map(|o| o.symbol.as_str()).collect();
+    let coverage = covered.len() as f64 / config.symbols.len().max(1) as f64;
+    let valid = coverage >= config.min_coverage;
+    if !valid {
+        println!(
+            "RUN INVALID: coverage {coverage:.2} is below the configured minimum {:.2} —              only {} of {} symbols produced observations. Artifacts are retained.",
+            config.min_coverage,
+            covered.len(),
+            config.symbols.len()
+        );
+    }
+
     write_audit_reports(&root, run_id, &dataset_id, &observations)?;
     write_run_manifests(config, &root, run_id, &observation_set_id)?;
+    fs::write(
+        run_dir.join("validity.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "valid": valid,
+            "coverage": coverage,
+            "min_coverage": config.min_coverage,
+            "symbols_configured": config.symbols.len(),
+            "symbols_with_observations": covered.len(),
+        }))?,
+    )?;
 
     // Charts illustrate one representative configuration for the Stage 0 demo.
     // The summary table above, not the chart, is the source of truth across

@@ -1,3 +1,4 @@
+pub mod api;
 pub mod fixture;
 pub mod saved_files;
 pub mod vendor;
@@ -8,7 +9,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One row of `source_catalog.parquet`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,12 @@ pub trait NewsSource {
     fn vendor_names(&self) -> Vec<String>;
 
     fn fetch_raw_articles(&self, config: &PipelineConfig) -> Result<Vec<RawArticle>>;
+
+    /// Requests made, statuses, retries, rate limits, outages. `None` for sources
+    /// that make no requests (fixture, saved files).
+    fn ingest_log(&self) -> Option<Vec<crate::source::api::http::IngestLogRow>> {
+        None
+    }
 }
 
 /// A swappable supplier of OHLCV price bars.
@@ -45,12 +52,17 @@ fn saved_files_dir(config: &PipelineConfig) -> Result<&Path> {
     }
 }
 
+fn cache_dir(config: &PipelineConfig) -> PathBuf {
+    Path::new(&config.output_root).join("cache")
+}
+
 pub fn news_source(config: &PipelineConfig) -> Result<Box<dyn NewsSource>> {
     match config.news_source {
         SourceMode::Fixture => Ok(Box::new(fixture::FixtureSource)),
         SourceMode::SavedFiles => Ok(Box::new(saved_files::SavedFileSource::new(
             saved_files_dir(config)?,
         )?)),
+        SourceMode::Api => Ok(Box::new(api::ApiSource::new(&cache_dir(config))?)),
     }
 }
 
@@ -60,6 +72,7 @@ pub fn price_source(config: &PipelineConfig) -> Result<Box<dyn PriceSource>> {
         SourceMode::SavedFiles => Ok(Box::new(saved_files::SavedFileSource::new(
             saved_files_dir(config)?,
         )?)),
+        SourceMode::Api => Ok(Box::new(api::ApiSource::new(&cache_dir(config))?)),
     }
 }
 
