@@ -77,7 +77,11 @@ struct BacktestArgs {
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(args) => run_loaded_config(args.stage, pipeline::run_fixture),
+        Commands::Run(args) => {
+            let config = Stage0Config::load(&args.stage.config)?;
+            let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
+            pipeline::run_all(&config, args.stage.output_root, args.stage.dry_run, &run_id)
+        }
         Commands::Fixture(args) => run_loaded_config(args, pipeline::run_fixture),
         Commands::BuildObservations(args) => {
             let config = Stage0Config::load(&args.stage.config)?;

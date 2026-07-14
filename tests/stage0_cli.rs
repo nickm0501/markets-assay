@@ -318,3 +318,33 @@ fn distinct_run_ids_keep_separate_backtest_reports_for_comparison() {
     );
     assert_ne!(low_cost_metrics, high_cost_metrics);
 }
+
+#[test]
+fn run_writes_summary_charts_and_decision() {
+    let temp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    cmd.args([
+        "run",
+        "--config",
+        "configs/stage0_fixture.json",
+        "--output-root",
+        temp.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("dataset_id=ds_"))
+    .stdout(predicate::str::contains("observation_set_id=obs_"))
+    .stdout(predicate::str::contains("configurations="));
+
+    let run_dir = temp.path().join("runs/stage0_fixture");
+    assert!(run_dir.join("reports/summary.md").exists());
+    assert!(run_dir.join("reports/coverage.csv").exists());
+    assert!(run_dir.join("reports/bucket_returns.csv").exists());
+    assert!(run_dir.join("reports/backtest_metrics.csv").exists());
+    assert!(run_dir.join("reports/trade_log.csv").exists());
+    assert!(run_dir.join("charts/bucket_returns.svg").exists());
+    assert!(run_dir.join("charts/equity_curve.svg").exists());
+    assert!(run_dir.join("config.json").exists());
+    assert!(run_dir.join("dataset_manifest.json").exists());
+    assert!(run_dir.join("observation_set_manifest.json").exists());
+}

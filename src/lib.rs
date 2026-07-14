@@ -9,6 +9,7 @@ pub mod ids;
 pub mod normalize;
 pub mod observations;
 pub mod pipeline;
+pub mod report;
 pub mod sentiment;
 pub mod storage;
 
