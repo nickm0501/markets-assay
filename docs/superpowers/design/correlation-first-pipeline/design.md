@@ -126,11 +126,11 @@ here.
   fetched, committed, and running; 95 tests green; the Decision Demo and the
   spec's hand-trace Required Test both pass on real data. Findings in
   `fixtures/saved_sample/README.md`.
-- active: **Direction/Design for Stage 2** — not yet started. Stage 2 is the
-  spec's "narrow Massive/GDELT/Alpaca source probe", but Stage 1 has already
-  *done* the probing (see Known), so Stage 2's real content is now: replace the
-  sentiment scorer, build the 4 baselines, and add the live-API source behind
-  the existing trait. That reframing needs a design pass before a plan.
+- done: **Stage 2 Design** — the scorer bake-off ran (Decisions 20-21), and
+  Stage 2 is planned:
+  `docs/superpowers/plans/2026-07-14-stage-2-real-experiment.md`.
+- active: **Development Handoff (Stage 2)** — awaiting confirmation the plan is
+  settled enough to implement.
 - done: Development Handoff (Stage 1) — plan reviewed via Lavish, four
   annotations applied (one of which, the quarantine/exclusion split, found a
   real defect in the design before any code was written — see Decision 15).
@@ -147,33 +147,28 @@ here.
 
 ### Next
 
-Three things now gate Stage 3's go/no-go. They are the whole of Stage 2:
+**Stage 2 is planned** (`docs/superpowers/plans/2026-07-14-stage-2-real-experiment.md`).
+It closes the three things standing between us and a real two-year test:
 
-1. **Replace the sentiment scorer.** This is the blocker, and Stage 1 measured
-   it rather than guessed it: `lexicon_hit_rate = 0.2021`. The 14-word lexicon
-   understands one real headline in five; the other 80% score exactly `0.0`,
-   indistinguishable from genuinely neutral news. It cleared its own gate by
-   0.002 — luck, not health. **Every downstream result is meaningless until this
-   is fixed**, because we are not currently measuring sentiment, we are
-   measuring silence. See S1-C and the hand-trace in
-   `fixtures/saved_sample/README.md`: the scorer read "Which AI Stocks May Soar
-   After Reaching Record Highs?" and scored it strongly positive on the strength
-   of two tokens.
-2. **Build the 4 baselines** (always-flat, random, prior-return momentum;
-   shuffled already exists). This is the other half of Decision 6's gate, still
-   open, and it must exist before any report is used for a real go/no-go.
-3. **Add the live-API source** behind the `NewsSource`/`PriceSource` trait, with
-   rate limiting and retries. Stage 1 hit 429s from *both* Massive and GDELT;
-   the throwaway fetch script handles them, but application code will need to do
-   it properly. Note the trait seam means this touches no research code.
+1. **We cannot read the news.** Fixed by Decision 20 (LM+VADER), now to be
+   shipped. Everything downstream is meaningless until this lands.
+2. **We cannot tell signal from noise.** Only 1 of the spec's 4 baselines
+   exists. Without the rest, `continue` means nothing — we cannot distinguish an
+   edge from a coin that landed well. This is Decision 6's still-open half.
+3. **We cannot fetch two years.** Ingestion is neither idempotent nor resumable,
+   and Massive's free tier is ~5 req/min: a two-year fetch is a multi-hour job
+   that *will* be interrupted. The spec has required this since day one and it
+   has never been built.
 
-The spec calls Stage 2 a "narrow Massive/GDELT/Alpaca source probe" — but Stage
-1 has already probed those sources and returned answers (see Known). Stage 2's
-real content is the three items above, and that reframing deserves a design pass
-before a plan.
+**Two things must NOT be forgotten before Stage 3 runs** (both now tracked as
+open questions):
 
-The 1-year-holdout sufficiency question (Open Questions) still stands and still
-blocks Stage 3.
+- **S2-B: the First Experiment Matrix is a quarter-built.** 1 of 4 measurement
+  horizons, 1 of 2 threshold pairs, 1 of 4 targets, no 15-minute bars, no
+  doubled-cost stress case. **Running the two-year experiment on a quarter of
+  the intended matrix would answer a question nobody asked.**
+- **The 1-year-holdout sufficiency question**, open since 2026-07-08. Stage 2's
+  baselines make the gates materially stronger; revisit once they exist.
 
 ## Description
 
@@ -275,10 +270,11 @@ the seam the spec always required and Stage 0 never built.
 | Is a 1-year development / 1-year holdout split sufficient for an initial go/no-go, and are the stop/revise/continue gates strong enough to act on? | Blocks confidence in Stage 3's result, not Stage 0 or Stage 1 implementation. | Revisit once Stage 0/2 mechanics are proven; may not need resolution until Stage 3 is planned. | Open |
 | S1-A: Are real Alpaca hourly bars session-aligned (09:30 ET) or clock-aligned (09:00 ET)? | Blocks Stage 1 Task 5. | **Look at the payload.** Cannot be answered from documentation or reasoning. If bars are clock-aligned, Decision 3's "drop any horizon a session close or gap prevents from being fully covered" rule could silently discard most of the sample. | Open |
 | S1-B: Does real syndication (same story, different URLs) actually appear in a 5-day / 4-ETF sample? | Blocks the *scope* of Stage 1 Task 6, not Stage 1 itself. | Count it in the saved sample. `normalize.rs:96-102` keys dedupe on `url + title`, which cannot catch a story republished under a different URL — but if the sample is too small to contain any, "no" is a valid answer that defers the work to Stage 2. | Open |
-| S1-C: Is the 14-word Stage 0 sentiment lexicon salvageable, or does the scorer need replacing? | Blocks Stage 2, not Stage 1. | Stage 1 measures `lexicon_hit_rate` on real headlines (Decision 17). If it is near zero, replacing the scorer becomes Stage 2's first design question. Stage 1 deliberately does not attempt the fix. | Open |
+| ~~S1-C: Is the 14-word lexicon salvageable, or does the scorer need replacing?~~ | — | **Closed 2026-07-14 — ANSWERED: it is not salvageable.** Measured `lexicon_hit_rate = 0.2021`. The bake-off replaced it with Loughran-McDonald + VADER (Decision 20): blindness 49%→2% on Massive, 94%→27% on GDELT; resolution 7→128 values; bias 14:1→4:1. | Closed |
 | ~~S1-D: Do vendor terms permit committing real payloads to the repo?~~ | — | **Closed 2026-07-14** at the user's direction: not a blocker for this project. The payloads get committed. | Closed |
 | **S2-A: GDELT text starvation.** GDELT supplies **title only, averaging 11 words**, for **65% of the corpus** (249/381 articles). ~~No scorer replacement fixes this.~~ **Correction (2026-07-14): that claim was wrong.** The bake-off measured it: the new scorer (LM+VADER) takes GDELT from **94% blind → 27% blind**, and from 3 distinct values → 101. VADER is built for short punchy text, which is what a headline is. **Mitigated, not solved** — 27% blind on 11-word titles is still thin. | No longer blocks the `broad_news` / `finance_plus_broad` source sets, which was the fear. Now a quality concern rather than a structural one. | Revisit *after* the new scorer ships and we can see real `broad_news` results. Remaining options if it still hurts: find a GDELT mode returning more text or its own GKG tone score; or accept title-only macro scoring and record the weakness honestly. **Lesson: this question was nearly closed on a plausible conjecture that measurement refuted.** | Open (downgraded) |
 
+| **S2-B: The First Experiment Matrix is far from complete.** We have 2 of ~3 news windows, **1 of 4** measurement horizons (missing next-4h, same-day close, next regular session), **1 of 2** threshold pairs (missing 10%), **1 of 4** targets (missing direction, volatility expansion, tail events), no 15-minute bars, and no doubled-cost stress case. | **Blocks Stage 3**, not Stage 2. | Needs its own plan. `session-to-now` and `same-day close` require session-relative logic that does not exist. **Running the two-year experiment on a quarter of the intended matrix would answer a question nobody asked** — do not let Stage 3 start without this. | Open |
 ## Supporting Artifacts
 
 - Spec (frozen, approved): `docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md`
