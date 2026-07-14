@@ -1,0 +1,653 @@
+<title>Correlation-First Pipeline — Spec (2026-07-08)</title>
+
+<style>
+  :root {
+    --paper: #f4f5f7;
+    --paper-raised: #ffffff;
+    --ink: #1c222b;
+    --ink-soft: #3a4250;
+    --slate: #5b6472;
+    --slate-faint: #838d9c;
+    --line: #d8dbe1;
+    --line-soft: #e6e8ec;
+    --brass: #a8752b;
+    --brass-soft: #f1e3cd;
+    --accepted: #2f7d6b;
+    --accepted-soft: #e2f0ec;
+    --open: #b5502f;
+    --open-soft: #f5e5df;
+    --shadow: 0 1px 2px rgba(28, 34, 43, 0.06), 0 8px 24px -12px rgba(28, 34, 43, 0.18);
+
+    --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "SF Mono", "IBM Plex Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14181f;
+      --paper-raised: #1b212b;
+      --ink: #e8eaee;
+      --ink-soft: #c3c9d2;
+      --slate: #9aa3b2;
+      --slate-faint: #6d7686;
+      --line: #2a303b;
+      --line-soft: #232933;
+      --brass: #d6a354;
+      --brass-soft: #362a17;
+      --accepted: #55b79c;
+      --accepted-soft: #172b26;
+      --open: #e08462;
+      --open-soft: #33201a;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #14181f;
+    --paper-raised: #1b212b;
+    --ink: #e8eaee;
+    --ink-soft: #c3c9d2;
+    --slate: #9aa3b2;
+    --slate-faint: #6d7686;
+    --line: #2a303b;
+    --line-soft: #232933;
+    --brass: #d6a354;
+    --brass-soft: #362a17;
+    --accepted: #55b79c;
+    --accepted-soft: #172b26;
+    --open: #e08462;
+    --open-soft: #33201a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  }
+  :root[data-theme="light"] {
+    --paper: #f4f5f7;
+    --paper-raised: #ffffff;
+    --ink: #1c222b;
+    --ink-soft: #3a4250;
+    --slate: #5b6472;
+    --slate-faint: #838d9c;
+    --line: #d8dbe1;
+    --line-soft: #e6e8ec;
+    --brass: #a8752b;
+    --brass-soft: #f1e3cd;
+    --accepted: #2f7d6b;
+    --accepted-soft: #e2f0ec;
+    --open: #b5502f;
+    --open-soft: #f5e5df;
+    --shadow: 0 1px 2px rgba(28, 34, 43, 0.06), 0 8px 24px -12px rgba(28, 34, 43, 0.18);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--brass); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--brass);
+    outline-offset: 2px;
+  }
+
+  code, .mono {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  code {
+    background: var(--line-soft);
+    border-radius: 4px;
+    padding: 0.1em 0.4em;
+  }
+
+  h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; overflow-wrap: break-word; color: var(--ink); }
+
+  /* ---------- status bar ---------- */
+
+  .statusbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1.5rem;
+    padding: 0.7rem 2rem;
+    background: var(--paper-raised);
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+  }
+
+  .statusbar .doc-name {
+    font-family: var(--font-mono);
+    color: var(--slate-faint);
+    margin-right: auto;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    padding: 0.22em 0.7em;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .pill.phase-active { background: var(--brass-soft); color: var(--brass); }
+  .pill::before { content: ""; width: 0.5em; height: 0.5em; border-radius: 999px; background: currentColor; }
+
+  /* ---------- header ---------- */
+
+  header.hero {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.75rem 2.5rem;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--slate);
+  }
+
+  h1.title {
+    font-size: clamp(1.9rem, 4vw, 2.5rem);
+    line-height: 1.15;
+    margin: 0.5rem 0 0.9rem;
+    text-wrap: pretty;
+    max-width: 100%;
+  }
+
+  .dek {
+    font-size: 1.05rem;
+    color: var(--ink-soft);
+    max-width: 42rem;
+  }
+
+  .dek b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- generic section shell ---------- */
+
+  section {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 2.25rem 1.75rem;
+  }
+
+  section.wide { max-width: 62rem; }
+
+  section + section { border-top: 1px solid var(--line-soft); }
+
+  h2.section-title {
+    font-size: 1.05rem;
+    letter-spacing: 0.01em;
+    margin: 0 0 1.1rem;
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+
+  h2.section-title .count {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 400;
+    color: var(--slate-faint);
+  }
+
+  h3.sub {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--slate);
+    font-weight: 600;
+    margin: 1.4rem 0 0.6rem;
+  }
+  h3.sub:first-child { margin-top: 0; }
+
+  p { margin: 0 0 1rem; }
+  p:last-child { margin-bottom: 0; }
+
+  ul.plain { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.65rem; }
+  ul.plain li { padding-left: 1.15rem; position: relative; }
+  ul.plain li::before {
+    content: "—";
+    position: absolute;
+    left: 0;
+    color: var(--slate-faint);
+  }
+
+  ul.plain.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem 2rem; }
+
+  ol.steps { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.7rem; counter-reset: step; }
+  ol.steps li {
+    padding-left: 2.1rem;
+    position: relative;
+    counter-increment: step;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 6px;
+    background: var(--brass-soft);
+    color: var(--brass);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  ol.steps li b { color: var(--ink); }
+
+  /* ---------- generic 2-col grid (scope, gates) ---------- */
+
+  .split-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem 2rem;
+  }
+
+  .split-grid h3 {
+    font-size: 0.85rem;
+    margin: 0 0 0.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .split-grid h3.go::before { content: ""; width: 0.55em; height: 0.55em; border-radius: 999px; background: var(--accepted); flex-shrink: 0; }
+  .split-grid h3.stop::before { content: ""; width: 0.55em; height: 0.55em; border-radius: 999px; background: var(--open); flex-shrink: 0; }
+
+  /* ---------- terminology / matrix table ---------- */
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+
+  table.terms { width: 100%; border-collapse: collapse; font-size: 0.9rem; min-width: 34rem; }
+  table.terms th, table.terms td { text-align: left; padding: 0.65rem 1rem; vertical-align: top; }
+  table.terms thead th {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--slate);
+    background: var(--paper-raised);
+    border-bottom: 1px solid var(--line);
+  }
+  table.terms tbody tr + tr td { border-top: 1px solid var(--line-soft); }
+  table.terms td.term code { white-space: nowrap; }
+  table.terms td.note { color: var(--slate); font-size: 0.86em; }
+
+  /* ---------- stage ledger ---------- */
+
+  .phase-ledger { display: grid; gap: 0.5rem; }
+  .phase-row { display: flex; gap: 0.6rem; align-items: baseline; font-size: 0.92rem; }
+  .phase-row .tag {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--slate-faint);
+    min-width: 5.2rem;
+    flex-shrink: 0;
+  }
+  .phase-row.is-active .tag { color: var(--brass); font-weight: 700; }
+  .phase-row span.text { color: var(--ink-soft); }
+  .phase-row.is-active span.text { color: var(--ink); font-weight: 600; }
+
+  /* ---------- artifacts / file tree ---------- */
+
+  .artifact-list { display: grid; gap: 0.75rem; }
+  .artifact-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+  .artifact-item .kind {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--slate-faint);
+    min-width: 6.5rem;
+  }
+  .artifact-item code { word-break: break-all; }
+
+  footer {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 2rem 1.75rem 4rem;
+    font-size: 0.8rem;
+    color: var(--slate-faint);
+    border-top: 1px solid var(--line-soft);
+  }
+
+  @media (max-width: 640px) {
+    .split-grid, ul.plain.two-col { grid-template-columns: 1fr; }
+    header.hero, section { padding-left: 1.25rem; padding-right: 1.25rem; }
+    .statusbar { padding: 0.7rem 1.25rem; }
+  }
+</style>
+
+<div class="statusbar">
+  <span class="doc-name">docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md</span>
+  <span class="pill phase-active">Approved for implementation planning</span>
+  <span class="mono" style="color: var(--slate);">frozen 2026-07-08</span>
+</div>
+
+<header class="hero">
+  <div class="eyebrow">Design Spec · Frozen</div>
+  <h1 class="title">Correlation-First Market Sentiment Pipeline</h1>
+  <p class="dek">
+    A local, rerunnable research pipeline that determines whether historical news
+    sentiment contains useful out-of-sample information about subsequent U.S.
+    equity and ETF returns. <b>Not a live-trading platform</b> — a useful result
+    must go beyond correlation and show that a moderately realistic
+    long/short/flat rule remains interesting after costs, timing constraints,
+    baselines, and an untouched holdout period.
+  </p>
+</header>
+
+<section aria-labelledby="decisions-title">
+  <h2 class="section-title" id="decisions-title">Fixed V1 Decisions</h2>
+  <ul class="plain">
+    <li>Vendor budget: zero dollars.</li>
+    <li>Research history: the latest complete two-year interval shared by all selected sources at first ingestion.</li>
+    <li>Development split: the first chronological year. Holdout split: the second, untouched until the primary configuration is frozen.</li>
+    <li>Universe: <code>SPY</code>, <code>QQQ</code>, <code>DIA</code>, <code>IWM</code>, then ~25 liquid U.S. large-cap equities after the source probe.</li>
+    <li>Price interval: one-hour bars primary, 15-minute secondary when reliable, daily as a sanity-check baseline.</li>
+    <li>Text input: article headline plus summary or description.</li>
+    <li>Sentiment: a deterministic, locally computed, versioned scoring method.</li>
+    <li>Strategy: symmetric long/short/flat rules.</li>
+    <li>Storage: immutable JSONL raw payloads, Parquet research datasets, and CSV/Markdown/static-chart reports.</li>
+  </ul>
+  <p style="margin-top: 1rem; color: var(--slate); font-size: 0.9rem;">
+    The two-year result is an initial signal-validation experiment — it cannot establish robustness across every market regime.
+  </p>
+</section>
+
+<section aria-labelledby="sources-title">
+  <h2 class="section-title" id="sources-title">Free Data Sources</h2>
+
+  <h3 class="sub">Finance &amp; Ticker News</h3>
+  <p>Massive Stocks Basic news endpoint — <code>GET /v2/reference/news</code>. Two years of history: title, description, publisher, URL, ticker tags, <code>published_utc</code>. Hourly updates.</p>
+
+  <h3 class="sub">Broad News</h3>
+  <p>GDELT for macro, policy, rates, housing, geopolitical, sector, and theme coverage. Free and open; prefer direct downloads for v1 — no BigQuery, to avoid separate cloud costs.</p>
+
+  <h3 class="sub">Market Prices</h3>
+  <p>Alpaca Basic historical market-data API. U.S. stock/ETF history back to 2016, 200 requests/min — enough for this offline experiment.</p>
+
+  <h3 class="sub">Excluded</h3>
+  <p>X and other paid social feeds — access, historical depth, licensing, and pricing not verified for this experiment.</p>
+</section>
+
+<section aria-labelledby="terms-title">
+  <h2 class="section-title" id="terms-title">Core Terminology</h2>
+  <div class="table-scroll">
+    <table class="terms">
+      <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td class="term"><code>news_window</code></td><td>Historical articles included in a signal — e.g. trailing 1h, trailing 4h, session-to-now.</td></tr>
+        <tr><td class="term"><code>signal_time</code></td><td>Time at which an aggregated signal is available for analysis or trading.</td></tr>
+        <tr><td class="term"><code>measurement_horizon</code></td><td>Future market period measured after <code>signal_time</code>.</td></tr>
+        <tr><td class="term"><code>price_interval</code></td><td>OHLCV bar duration.</td></tr>
+        <tr><td class="term"><code>source_set</code></td><td>Configured source mixture used to create an observation.</td></tr>
+        <tr><td class="term"><code>dataset_id</code></td><td>Immutable identifier for a versioned input snapshot.</td></tr>
+        <tr><td class="term"><code>observation_set_id</code></td><td>Immutable identifier for observations derived from one dataset + aggregation configuration.</td></tr>
+        <tr><td class="term"><code>run_id</code></td><td>Identifier for one analysis or backtest configuration and result.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section aria-labelledby="arch-title">
+  <h2 class="section-title" id="arch-title">Architecture <span class="count">9 CLI stages</span></h2>
+  <p>The CLI is divided into independently testable stages. Vendor-specific code stays behind news and price source adapters — fixture, curated-file, and API modes must produce the same normalized schemas.</p>
+  <ol class="steps">
+    <li><b>fixture</b> — creates deterministic synthetic inputs.</li>
+    <li><b>ingest</b> — fetches or loads news and prices through source adapters.</li>
+    <li><b>normalize</b> — converts vendor payloads to canonical records.</li>
+    <li><b>score</b> — computes sentiment and market-relevance labels.</li>
+    <li><b>build-observations</b> — aligns news signals with market context and future measurements.</li>
+    <li><b>analyze</b> — runs non-trading correlation, bucket, lag, source, and tail tests.</li>
+    <li><b>backtest</b> — applies long/short/flat rules with execution costs.</li>
+    <li><b>report</b> — generates decision-oriented tables, charts, and a summary.</li>
+    <li><b>run</b> — may orchestrate required stages while reusing existing snapshots.</li>
+  </ol>
+</section>
+
+<section aria-labelledby="flow-title">
+  <h2 class="section-title" id="flow-title">Data Flow</h2>
+  <ol class="steps">
+    <li>Ingest source payloads once and retain them unchanged.</li>
+    <li>Normalize timestamps, publishers, symbols, themes, and price fields.</li>
+    <li>Deduplicate syndicated and republished articles.</li>
+    <li>Score headline and summary sentiment locally.</li>
+    <li>Classify each article as ticker-specific, sector/theme, or macro-market.</li>
+    <li>Map direct and indirect relevance to tradable symbols using versioned rules.</li>
+    <li>Aggregate eligible articles for each configured <code>news_window</code> at each <code>signal_time</code>.</li>
+    <li>Join only price information available at <code>signal_time</code>.</li>
+    <li>Measure returns, volatility, drawdown, runup, and tail events strictly after <code>signal_time</code>.</li>
+    <li>Store the generated observations as a reusable observation set.</li>
+    <li>Analyze or backtest that observation set without refetching source data.</li>
+  </ol>
+  <p style="margin-top: 1rem; color: var(--slate); font-size: 0.9rem;">
+    Changing thresholds/costs reruns only the backtest. Changing windows, relevance rules, source sets, or sentiment scoring regenerates observations from the stored snapshot. Adding history creates a new immutable dataset snapshot.
+  </p>
+</section>
+
+<section aria-labelledby="storage-title">
+  <h2 class="section-title" id="storage-title">Stored Data</h2>
+
+  <h3 class="sub">data/datasets/&lt;dataset_id&gt;/</h3>
+  <div class="artifact-list">
+    <div class="artifact-item"><span class="kind">raw dir</span><code>raw/</code> — immutable vendor JSONL payloads</div>
+    <div class="artifact-item"><span class="kind">parquet</span><code>normalized_articles.parquet</code></div>
+    <div class="artifact-item"><span class="kind">parquet</span><code>price_bars.parquet</code></div>
+    <div class="artifact-item"><span class="kind">parquet</span><code>source_catalog.parquet</code></div>
+    <div class="artifact-item"><span class="kind">manifest</span><code>manifest.json</code> — sources, date boundaries, schema versions, row counts, checksums, coverage, creation time</div>
+  </div>
+
+  <h3 class="sub">data/observation_sets/&lt;observation_set_id&gt;/</h3>
+  <div class="artifact-list">
+    <div class="artifact-item"><span class="kind">parquet</span><code>news_signal_observations.parquet</code></div>
+    <div class="artifact-item"><span class="kind">manifest</span><code>manifest.json</code> — source <code>dataset_id</code>, aggregation config, sentiment/relevance-rule versions, schema, row count, checksums, creation time</div>
+  </div>
+
+  <h3 class="sub">runs/&lt;run_id&gt;/</h3>
+  <div class="artifact-list">
+    <div class="artifact-item"><span class="kind">config</span><code>config.json</code>, <code>dataset_manifest.json</code>, <code>observation_set_manifest.json</code></div>
+    <div class="artifact-item"><span class="kind">reports</span><code>reports/summary.md</code>, <code>coverage.csv</code>, <code>bucket_returns.csv</code>, <code>backtest_metrics.csv</code>, <code>trade_log.csv</code></div>
+    <div class="artifact-item"><span class="kind">charts</span><code>charts/</code></div>
+  </div>
+</section>
+
+<section aria-labelledby="dataset-title">
+  <h2 class="section-title" id="dataset-title">Main Research Dataset</h2>
+  <p>
+    <code>news_signal_observations</code> contains one row per
+    <code>symbol × signal_time × news_window × measurement_horizon × price_interval × source_set</code>.
+  </p>
+  <ul class="plain two-col">
+    <li>Article counts by ticker, sector/theme, macro scope</li>
+    <li>Source and publisher counts</li>
+    <li>Mean, weighted, extreme, dispersion sentiment features</li>
+    <li>Prior return, volatility, session, after-hours context</li>
+    <li>Future return, volatility, tail event, max drawdown/runup</li>
+    <li>Contributing article and price-bar identifiers</li>
+    <li>Dataset and run lineage</li>
+  </ul>
+</section>
+
+<section aria-labelledby="sentiment-title">
+  <h2 class="section-title" id="sentiment-title">Sentiment &amp; Relevance</h2>
+  <p>The first scorer is deterministic and versioned — operates on headline + summary, emits a bounded score, and records enough intermediate values to explain a result. Vendor sentiment may be stored as a benchmark but is not ground truth.</p>
+  <p>Ticker tags are one relevance input, not the only one. Configured mappings propagate direct company news to linked equities, sector/theme news to relevant equities and ETFs, and macro news to broad-market or economically exposed symbols.</p>
+  <p style="margin-bottom: 0;">Source sets evaluated separately: <code>finance_only</code>, <code>broad_news</code>, <code>finance_plus_broad</code>.</p>
+</section>
+
+<section aria-labelledby="matrix-title" class="wide">
+  <h2 class="section-title" id="matrix-title">First Experiment Matrix</h2>
+  <div class="table-scroll">
+    <table class="terms">
+      <thead><tr><th>Dimension</th><th>Values</th></tr></thead>
+      <tbody>
+        <tr><td class="term">Price interval</td><td>One hour primary; 15 minutes secondary if the source probe confirms reliable coverage.</td></tr>
+        <tr><td class="term">News windows</td><td>Trailing 1h, trailing 4h, session-to-now.</td></tr>
+        <tr><td class="term">Measurement horizons</td><td>Next hour, next 4h, same-day close, next regular session.</td></tr>
+        <tr><td class="term">Strategy thresholds</td><td>Top/bottom 10% and 20% of development sentiment distributions.</td></tr>
+        <tr><td class="term">Trading costs</td><td>0, 5, 10 bps, plus a doubled-cost stress case for the selected configuration.</td></tr>
+        <tr><td class="term">Baselines</td><td>Always-flat, random signal, shuffled sentiment, prior-return momentum.</td></tr>
+        <tr><td class="term">Targets</td><td>Future return, direction, volatility expansion, tail-event occurrence.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p style="margin-top: 1rem; color: var(--slate); font-size: 0.9rem;">
+    The primary matrix is frozen before holdout evaluation. Added configurations are labeled exploratory and cannot count as proof unless tested on new untouched data.
+  </p>
+</section>
+
+<section aria-labelledby="validation-title">
+  <h2 class="section-title" id="validation-title">Validation</h2>
+  <p>The latest common two-year source interval is frozen at first ingestion. The first year is used for exploration and chronological walk-forward validation; the second year is the final untouched holdout.</p>
+  <p>Parameter selection uses only the development year. Quantile thresholds are learned from development data and then frozen. The holdout is evaluated once for the primary result — repeated holdout-driven tuning is prohibited.</p>
+  <p style="margin-bottom: 0;">Source-set comparisons use identical symbols, dates, windows, and market data. Uncertainty estimates use time-aware resampling so correlated intraday observations aren't treated as fully independent.</p>
+</section>
+
+<section aria-labelledby="backtest-title">
+  <h2 class="section-title" id="backtest-title">Backtest Rules</h2>
+  <ul class="plain">
+    <li>Enter at the next configured tradable bar after <code>signal_time</code>.</li>
+    <li>Never trade on an article before its publication timestamp.</li>
+    <li>Defer after-hours signals to the next regular-session tradable bar.</li>
+    <li>Long only the selected upper sentiment quantile; short only the lower quantile; remain flat in the middle.</li>
+    <li>Report gross and net returns.</li>
+    <li>Apply spread/slippage through the configured basis-point cost.</li>
+    <li>Report long and short sides separately as well as combined.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="quality-title">
+  <h2 class="section-title" id="quality-title">Data Quality &amp; Error Handling</h2>
+  <ul class="plain two-col">
+    <li>Normalize all timestamps to UTC while retaining originals.</li>
+    <li>Quarantine articles with absent/ambiguous publication times.</li>
+    <li>Deduplicate syndicated and republished articles before aggregation.</li>
+    <li>Respect weekends, holidays, early closes, after-hours, DST transitions.</li>
+    <li>Do not silently forward-fill missing news or price bars.</li>
+    <li>Make ingestion idempotent and resumable.</li>
+    <li>Record rate-limit responses, retries, source outages, dropped rows, coverage gaps.</li>
+    <li>Mark a run invalid when material coverage gaps violate its configured minimum.</li>
+    <li>Keep failed experiments and diagnostics as first-class run artifacts.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="tests-title">
+  <h2 class="section-title" id="tests-title">Required Tests <span class="count">10</span></h2>
+  <ul class="plain two-col">
+    <li>News-window boundary tests.</li>
+    <li>Publication-time and no-lookahead tests.</li>
+    <li>Next-bar and after-hours execution tests.</li>
+    <li>Weekend, holiday, early-close, DST tests.</li>
+    <li>Article deduplication tests.</li>
+    <li>Price return and backtest accounting tests, incl. shorts.</li>
+    <li>Determinism tests for identical snapshot/config/seed.</li>
+    <li>A manually traceable fixture observation, raw article → trade.</li>
+    <li>Synthetic positive/negative/neutral/shuffled-signal controls.</li>
+    <li>Integration tests covering fixture through final report generation.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="demo-title">
+  <h2 class="section-title" id="demo-title">Decision Demo</h2>
+  <ol class="steps">
+    <li>Ingest or generate a dataset snapshot once.</li>
+    <li>Run a baseline analysis and backtest.</li>
+    <li>Show summary, coverage, bucket returns, equity curve, drawdown, metrics, trade log.</li>
+    <li>Change one window, threshold, or cost assumption.</li>
+    <li>Rerun without downloading source data.</li>
+    <li>Compare both runs.</li>
+    <li>End with an explicit <code>stop</code>, <code>revise</code>, <code>expand data</code>, <code>expand sources</code>, or <code>continue</code> recommendation.</li>
+  </ol>
+</section>
+
+<section aria-labelledby="gates-title">
+  <h2 class="section-title" id="gates-title">Success &amp; Failure Gates</h2>
+  <div class="split-grid">
+    <div>
+      <h3 class="go">Promising when</h3>
+      <ul class="plain">
+        <li>Held-out top-minus-bottom sentiment return spread is positive.</li>
+        <li>Held-out long/short strategy is profitable after moderate costs.</li>
+        <li>Selected result remains profitable under doubled costs.</li>
+        <li>Development walk-forward periods show consistent direction.</li>
+        <li>Results are not dominated by one symbol, source, week, or event.</li>
+        <li>Tail-event prediction improves over non-sentiment baselines.</li>
+        <li>Source coverage and timestamp validity pass configured checks.</li>
+      </ul>
+    </div>
+    <div>
+      <h3 class="stop">Stop or revise when</h3>
+      <ul class="plain">
+        <li>Coverage is too sparse or publication times are unreliable.</li>
+        <li>Sentiment performs no better than shuffled or non-sentiment baselines.</li>
+        <li>The apparent edge disappears under next-bar execution or simple costs.</li>
+        <li>Results depend on one fragile configuration or isolated event.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="stages-title">
+  <h2 class="section-title" id="stages-title">Delivery Stages</h2>
+  <div class="phase-ledger">
+    <div class="phase-row is-active"><span class="tag">Stage 0</span><span class="text">Deterministic fixture pipeline and synthetic signal demo.</span></div>
+    <div class="phase-row"><span class="tag">Stage 1</span><span class="text">Hand-curated real sample for timestamp and leakage inspection.</span></div>
+    <div class="phase-row"><span class="tag">Stage 2</span><span class="text">Narrow Massive, GDELT, and Alpaca source probe.</span></div>
+    <div class="phase-row"><span class="tag">Stage 3</span><span class="text">Free two-year hypothesis test.</span></div>
+    <div class="phase-row"><span class="tag">Stage 4</span><span class="text">Expanded paid history or modeling, only if Stage 3 justifies it.</span></div>
+  </div>
+  <p style="margin-top: 1rem; color: var(--slate); font-size: 0.9rem;">
+    Every stage produces the same dataset lineage, reports, controls, and explicit next decision.
+  </p>
+</section>
+
+<section aria-labelledby="nongoals-title">
+  <h2 class="section-title" id="nongoals-title">V1 Non-Goals</h2>
+  <ul class="plain two-col" style="color: var(--slate);">
+    <li>Live trading or brokerage execution</li>
+    <li>Interactive dashboards</li>
+    <li>Tick-level market data</li>
+    <li>Futures, options, or exact benchmark-index feeds</li>
+    <li>Portfolio optimization</li>
+    <li>Supervised or deep-learning models</li>
+    <li>Mandatory social-media ingestion</li>
+    <li>Production-grade proof across many market regimes</li>
+  </ul>
+</section>
+
+<footer>
+  Source: <code>docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md</code> — frozen, dated record. Cross-cutting decisions made after this date live in the design review, not here.
+</footer>
