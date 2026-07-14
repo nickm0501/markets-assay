@@ -1,4 +1,4 @@
-use crate::config::Stage0Config;
+use crate::{config::Stage0Config, pipeline};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -77,12 +77,20 @@ struct BacktestArgs {
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(args) => print_loaded_config(args.stage, "run"),
-        Commands::Fixture(args) => print_loaded_config(args, "fixture"),
+        Commands::Run(args) => run_loaded_config(args.stage, pipeline::run_fixture),
+        Commands::Fixture(args) => run_loaded_config(args, pipeline::run_fixture),
         Commands::BuildObservations(args) => print_loaded_config(args.stage, "build-observations"),
         Commands::Analyze(args) => print_loaded_config(args.stage, "analyze"),
         Commands::Backtest(args) => print_loaded_config(args.observation.stage, "backtest"),
     }
+}
+
+fn run_loaded_config(
+    args: StageArgs,
+    runner: fn(&Stage0Config, Option<PathBuf>, bool) -> Result<()>,
+) -> Result<()> {
+    let config = Stage0Config::load(&args.config)?;
+    runner(&config, args.output_root, args.dry_run)
 }
 
 fn print_loaded_config(args: StageArgs, command_name: &str) -> Result<()> {

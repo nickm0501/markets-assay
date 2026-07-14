@@ -41,3 +41,21 @@ fn run_accepts_checked_in_stage0_config() {
     .stdout(predicate::str::contains("stage0_fixture"))
     .stdout(predicate::str::contains("dry_run=true"));
 }
+
+#[test]
+fn fixture_command_prints_generated_record_counts() {
+    let temp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    cmd.args([
+        "fixture",
+        "--config",
+        "configs/stage0_fixture.json",
+        "--output-root",
+        temp.path().to_str().unwrap(),
+        "--dry-run",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("articles=6"))
+    .stdout(predicate::str::contains("price_bars="));
+}
