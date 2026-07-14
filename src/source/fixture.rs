@@ -1,11 +1,12 @@
 use crate::{
     calendar::{is_trading_day, regular_open},
-    config::Stage0Config,
+    config::PipelineConfig,
     domain::{
         article::{RawArticle, SourceKind},
         market::PriceBar,
     },
     ids::stable_id,
+    source::{NewsSource, PriceSource},
 };
 use anyhow::Result;
 use chrono::{Duration, TimeZone, Utc};
@@ -16,7 +17,32 @@ pub struct FixtureData {
     pub price_bars: Vec<PriceBar>,
 }
 
-pub fn generate_fixture(config: &Stage0Config) -> Result<FixtureData> {
+/// Stage 0's made-up data, now reachable through the same trait the saved-file
+/// reader and (later) the live-API source implement. The generation logic below
+/// is unchanged from when it was hardwired into `pipeline.rs`.
+pub struct FixtureSource;
+
+impl NewsSource for FixtureSource {
+    fn vendor_names(&self) -> Vec<String> {
+        vec!["fixture".to_string()]
+    }
+
+    fn fetch_raw_articles(&self, config: &PipelineConfig) -> Result<Vec<RawArticle>> {
+        Ok(generate_fixture(config)?.raw_articles)
+    }
+}
+
+impl PriceSource for FixtureSource {
+    fn vendor_names(&self) -> Vec<String> {
+        vec!["fixture".to_string()]
+    }
+
+    fn fetch_price_bars(&self, config: &PipelineConfig) -> Result<Vec<PriceBar>> {
+        Ok(generate_fixture(config)?.price_bars)
+    }
+}
+
+pub fn generate_fixture(config: &PipelineConfig) -> Result<FixtureData> {
     let raw_articles = vec![
         article(
             "massive-1",
@@ -108,7 +134,8 @@ fn article(
         vendor_id: vendor_id.into(),
         source: source.into(),
         source_kind,
-        published_at: published_at.parse().unwrap(),
+        published_at: Some(published_at.parse().unwrap()),
+        published_at_raw: published_at.into(),
         title: title.into(),
         summary: summary.into(),
         url: url.into(),
@@ -117,7 +144,7 @@ fn article(
     }
 }
 
-fn generate_price_bars(config: &Stage0Config) -> Result<Vec<PriceBar>> {
+fn generate_price_bars(config: &PipelineConfig) -> Result<Vec<PriceBar>> {
     let mut bars = Vec::new();
     let mut date = Utc
         .with_ymd_and_hms(2026, 6, 29, 0, 0, 0)
@@ -177,10 +204,10 @@ fn fixture_return(symbol: &str, start: chrono::DateTime<Utc>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Stage0Config;
+    use crate::config::PipelineConfig;
 
-    fn config() -> Stage0Config {
-        Stage0Config::load("configs/stage0_fixture.json").unwrap()
+    fn config() -> PipelineConfig {
+        PipelineConfig::load("configs/stage0_fixture.json").unwrap()
     }
 
     #[test]
@@ -228,12 +255,10 @@ mod tests {
                 .count()
                 >= 2
         );
-        assert!(
-            fixture
-                .raw_articles
-                .iter()
-                .any(|a| a.published_at.to_rfc3339() == "2026-07-02T21:15:00+00:00")
-        );
+        assert!(fixture.raw_articles.iter().any(|a| {
+            a.published_at
+                .is_some_and(|at| at.to_rfc3339() == "2026-07-02T21:15:00+00:00")
+        }));
     }
 
     #[test]

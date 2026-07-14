@@ -13,17 +13,28 @@ use std::{
 
 pub fn write_parquet<T>(path: &Path, rows: &[T]) -> Result<()>
 where
-    T: Serialize,
+    T: Serialize + DeserializeOwned,
 {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Trace the Arrow schema from the actual rows (Serialize) rather than the
-    // type (from_type would additionally require Deserialize, which write-only
-    // row types such as SourceCatalogRow do not implement).
-    // `enums_without_data_as_strings` encodes our unit enums (SourceKind,
-    // NewsScope, SentimentLabel) as Arrow strings, matching their snake_case
-    // serde representation, instead of erroring on data-less enum variants.
+    // The schema is inferred from the rows, which is only safe because our
+    // domain enums serialize as plain STRINGS rather than as serde enums (see
+    // the `serde(into/try_from = "String")` attributes on SourceKind, NewsScope,
+    // and SentimentLabel).
+    //
+    // That indirection is load-bearing, not decoration. Stage 1's real data
+    // contains no `NewsScope::SectorTheme` article at all — Massive articles
+    // always carry tickers, GDELT articles never do — which left a HOLE in the
+    // middle of the enum's variant indices. serde_arrow traced the field as a
+    // Union with a `Null`-typed `UnknownVariant` placeholder and refused to
+    // write the file. The fixture survived only by luck: its one unobserved
+    // variant happened to be the *last* one.
+    //
+    // A snapshot's schema must not depend on which values its data happens to
+    // contain. `from_type` would fix that too, but it cannot see through
+    // `DateTime<Utc>` (chrono is not self-describing), so we make the enums
+    // self-describing instead.
     let options = TracingOptions::default().enums_without_data_as_strings(true);
     let fields = Vec::<FieldRef>::from_samples(rows, options)?;
     let batch = serde_arrow::to_record_batch(&fields, &rows)?;

@@ -1,6 +1,6 @@
 use crate::{
     calendar::is_regular_session,
-    config::Stage0Config,
+    config::PipelineConfig,
     domain::{
         article::{NewsScope, NormalizedArticle, SentimentLabel, SourceKind},
         market::PriceBar,
@@ -13,7 +13,7 @@ use chrono::Duration;
 use std::collections::BTreeSet;
 
 pub fn build_observations(
-    config: &Stage0Config,
+    config: &PipelineConfig,
     dataset_id: &str,
     articles: &[NormalizedArticle],
     price_bars: &[PriceBar],
@@ -52,7 +52,7 @@ pub fn build_observations(
 
 #[allow(clippy::too_many_arguments)]
 fn build_one(
-    config: &Stage0Config,
+    config: &PipelineConfig,
     dataset_id: &str,
     articles: &[NormalizedArticle],
     price_bars: &[PriceBar],
@@ -62,6 +62,25 @@ fn build_one(
     source_set: &str,
 ) -> Result<Option<NewsSignalObservation>> {
     let signal_time = signal_bar.start_time;
+
+    // A non-regular-session bar can never be an ENTRY bar.
+    //
+    // Real Alpaca hourly bars are clock-aligned (:00) and include pre-market and
+    // after-hours: the 12:00Z bar is 08:00 ET (pre-market), the 20:00Z bar is
+    // 16:00 ET (the close), and the 13:00Z bar spans 09:00-10:00 ET, straddling
+    // the 09:30 open — half of it is pre-market, so its `open` is a price that
+    // never traded in the regular session. Entering on any of those would violate
+    // the spec's "defer after-hours signals to the next regular-session tradable
+    // bar", silently, with plausible-looking fills.
+    //
+    // The fixture never caught this because it only ever generated regular-session
+    // bars. We keep these bars in the dataset — they are legitimate context for
+    // prior_return, and `market_session` / `is_after_hours_signal` exist precisely
+    // to describe them (design.md Decision 5) — but they cannot open a trade.
+    if !is_regular_session(signal_time, &config.holidays, &config.early_closes) {
+        return Ok(None);
+    }
+
     let window_start = signal_time - Duration::minutes(news_window_minutes);
     let eligible: Vec<&NormalizedArticle> = articles
         .iter()
@@ -80,6 +99,15 @@ fn build_one(
     // observation. If the bars covering the window aren't fully contiguous
     // (e.g. a holiday or session close truncates it), the observation is
     // dropped rather than aggregated over a partial, misleading window.
+    //
+    // The measurement bars must ALSO be regular-session bars. This is not
+    // belt-and-braces — it is load-bearing. Decision 3 says a horizon that a
+    // session close prevents from being fully covered must be DROPPED. That rule
+    // worked on the fixture only because no after-hours bars existed: the bars
+    // simply ran out at the close. Now that real data supplies after-hours bars,
+    // an unfiltered contiguity check would happily bridge the close using them —
+    // silently reversing Decision 3 and measuring "the next hour" across a
+    // boundary the market never traded through.
     let exit_time = signal_time + Duration::minutes(measurement_horizon_minutes);
     let mut future_bars: Vec<&PriceBar> = price_bars
         .iter()
@@ -87,6 +115,7 @@ fn build_one(
             bar.symbol == signal_bar.symbol
                 && bar.start_time >= signal_time
                 && bar.end_time <= exit_time
+                && is_regular_session(bar.start_time, &config.holidays, &config.early_closes)
         })
         .collect();
     future_bars.sort_by_key(|bar| bar.start_time);
@@ -238,17 +267,21 @@ fn source_set_includes(source_set: &str, article: &NormalizedArticle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Stage0Config, fixture::generate_fixture, normalize::normalize_articles};
+    use crate::{
+        config::PipelineConfig, normalize::normalize_articles, source::fixture::generate_fixture,
+    };
 
-    fn config() -> Stage0Config {
-        Stage0Config::load("configs/stage0_fixture.json").unwrap()
+    fn config() -> PipelineConfig {
+        PipelineConfig::load("configs/stage0_fixture.json").unwrap()
     }
 
     #[test]
     fn observations_include_one_row_per_symbol_signal_window_horizon_source_set() {
         let config = config();
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let observations =
             build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
 
@@ -276,7 +309,9 @@ mod tests {
         // Decision 5).
         let config = config();
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let observations =
             build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
         let before_deferral = observations
@@ -312,10 +347,51 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_market_or_after_hours_bar_can_never_be_an_entry_bar() {
+        // Pinned against REAL Alpaca bar times (2025-07-02, fetched 2026-07-14).
+        // Alpaca's hourly bars are clock-aligned (:00) and include pre/post
+        // market, so the raw series looks like:
+        //
+        //   12:00Z = 08:00 ET  pre-market
+        //   13:00Z = 09:00 ET  STRADDLES the 09:30 open (half pre-market!)
+        //   14:00Z = 10:00 ET  regular
+        //   ...
+        //   20:00Z = 16:00 ET  the close / after-hours
+        //
+        // Entering on any of these would violate the spec's "defer after-hours
+        // signals to the next regular-session tradable bar". The fixture never
+        // exercised this because it only generated regular-session bars.
+        let config = config();
+        let holidays = &config.holidays;
+        let early = &config.early_closes;
+        let at = |t: &str| -> chrono::DateTime<chrono::Utc> { t.parse().unwrap() };
+
+        // 2025-07-02 is EDT (UTC-4): regular session is 13:30Z..20:00Z.
+        assert!(
+            !is_regular_session(at("2025-07-02T12:00:00Z"), holidays, early),
+            "08:00 ET is pre-market"
+        );
+        assert!(
+            !is_regular_session(at("2025-07-02T13:00:00Z"), holidays, early),
+            "09:00 ET straddles the 09:30 open; its open price never traded in-session"
+        );
+        assert!(
+            is_regular_session(at("2025-07-02T14:00:00Z"), holidays, early),
+            "10:00 ET is regular"
+        );
+        assert!(
+            !is_regular_session(at("2025-07-02T20:00:00Z"), holidays, early),
+            "16:00 ET is the close, not a tradable entry"
+        );
+    }
+
+    #[test]
     fn observations_measure_future_returns_after_signal_time() {
         let config = config();
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let observations =
             build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
         let spy_positive = observations
@@ -343,7 +419,9 @@ mod tests {
         let mut config = config();
         config.measurement_horizons_minutes = vec![240];
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let observations =
             build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
 
@@ -385,7 +463,9 @@ mod tests {
         // observation's entry.
         let config = config();
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let observations =
             build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap();
         let articles_by_id: std::collections::BTreeMap<_, _> = articles

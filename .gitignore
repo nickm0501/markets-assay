@@ -1,3 +1,11 @@
 target/
 .worktrees/
 artifacts/
+
+# Real API keys. Never commit these. `.env.example` is the committed template.
+.env
+.env.*
+!.env.example
+
+# Editor config
+.obsidian/

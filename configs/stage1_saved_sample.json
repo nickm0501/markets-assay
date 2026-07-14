@@ -1,0 +1,46 @@
+{
+  "run_id": "stage1_saved_sample",
+  "output_root": "artifacts",
+  "generated_at": "2026-07-14T00:00:00Z",
+  "news_source": "saved_files",
+  "price_source": "saved_files",
+  "saved_files_dir": "fixtures/saved_sample",
+  "dataset_date_start": "2025-07-01",
+  "dataset_date_end": "2025-07-07",
+
+  "symbols": [
+    "SPY", "QQQ", "DIA", "IWM",
+    "AAPL", "AMZN", "AMD", "AVGO", "GOOGL", "MSFT", "NVDA", "TSLA"
+  ],
+
+  "constituent_etf_map": {
+    "AAPL":  ["QQQ", "SPY"],
+    "AMZN":  ["QQQ", "SPY"],
+    "AMD":   ["QQQ", "SPY"],
+    "AVGO":  ["QQQ", "SPY"],
+    "GOOGL": ["QQQ", "SPY"],
+    "GOOG":  ["QQQ", "SPY"],
+    "MSFT":  ["QQQ", "SPY", "DIA"],
+    "NVDA":  ["QQQ", "SPY"],
+    "TSLA":  ["QQQ", "SPY"]
+  },
+
+  "source_sets": ["finance_only", "broad_news", "finance_plus_broad"],
+  "news_windows_minutes": [60, 240],
+  "measurement_horizons_minutes": [60],
+  "price_interval_minutes": 60,
+  "long_quantile": 0.8,
+  "short_quantile": 0.2,
+  "costs_bps": [0.0, 5.0, 10.0],
+
+  "holidays": ["2025-07-04"],
+  "early_closes": { "2025-07-03": "13:00" },
+
+  "theme_symbol_map": {
+    "technology": ["QQQ"],
+    "rates": ["SPY", "QQQ", "DIA", "IWM"],
+    "housing": ["SPY", "IWM"],
+    "markets": ["SPY", "QQQ", "DIA", "IWM"]
+  },
+  "macro_symbols": ["SPY", "QQQ", "DIA", "IWM"]
+}

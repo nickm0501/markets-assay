@@ -1,4 +1,4 @@
-use crate::{config::Stage0Config, pipeline};
+use crate::{config::PipelineConfig, pipeline};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -14,6 +14,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run(RunArgs),
+    /// Build a dataset snapshot from whichever sources the config selects.
+    Ingest(StageArgs),
+    /// Alias for `ingest` against a fixture config. Kept because Stage 0's
+    /// docs and tests invoke it by name; it forces no behavior of its own.
     Fixture(StageArgs),
     BuildObservations(StageArgsWithDataset),
     Analyze(StageArgsWithObservationSet),
@@ -78,13 +82,15 @@ pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run(args) => {
-            let config = Stage0Config::load(&args.stage.config)?;
+            let config = PipelineConfig::load(&args.stage.config)?;
             let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
             pipeline::run_all(&config, args.stage.output_root, args.stage.dry_run, &run_id)
         }
-        Commands::Fixture(args) => run_loaded_config(args, pipeline::run_fixture),
+        Commands::Ingest(args) | Commands::Fixture(args) => {
+            run_loaded_config(args, pipeline::run_ingest)
+        }
         Commands::BuildObservations(args) => {
-            let config = Stage0Config::load(&args.stage.config)?;
+            let config = PipelineConfig::load(&args.stage.config)?;
             pipeline::run_build_observations(
                 &config,
                 args.stage.output_root,
@@ -93,7 +99,7 @@ pub fn run_cli() -> Result<()> {
             )
         }
         Commands::Analyze(args) => {
-            let config = Stage0Config::load(&args.stage.config)?;
+            let config = PipelineConfig::load(&args.stage.config)?;
             let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
             pipeline::run_analyze(
                 &config,
@@ -104,7 +110,7 @@ pub fn run_cli() -> Result<()> {
             )
         }
         Commands::Backtest(args) => {
-            let config = Stage0Config::load(&args.observation.stage.config)?;
+            let config = PipelineConfig::load(&args.observation.stage.config)?;
             let run_id = args
                 .observation
                 .run_id
@@ -124,8 +130,8 @@ pub fn run_cli() -> Result<()> {
 
 fn run_loaded_config(
     args: StageArgs,
-    runner: fn(&Stage0Config, Option<PathBuf>, bool) -> Result<()>,
+    runner: fn(&PipelineConfig, Option<PathBuf>, bool) -> Result<()>,
 ) -> Result<()> {
-    let config = Stage0Config::load(&args.config)?;
+    let config = PipelineConfig::load(&args.config)?;
     runner(&config, args.output_root, args.dry_run)
 }

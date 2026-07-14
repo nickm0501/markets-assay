@@ -20,17 +20,41 @@ pub fn write_summary(
         .iter()
         .filter(|analysis| analysis.recommendation == "continue")
         .count();
+    let quarantine_rate = analyses
+        .first()
+        .map(|analysis| analysis.quarantine_rate)
+        .unwrap_or(0.0);
+    let lexicon_hit_rate = analyses
+        .first()
+        .map(|analysis| analysis.lexicon_hit_rate)
+        .unwrap_or(0.0);
+    let degenerate_count = analyses
+        .iter()
+        .filter(|analysis| analysis.degenerate)
+        .count();
+
     let mut text = format!(
-        "# Stage 0 Research Summary\n\n\
+        "# Research Summary\n\n\
          dataset_id: {dataset_id}\n\n\
          observation_set_id: {observation_set_id}\n\n\
          configurations: {}\n\n\
          continue: {continue_count}\n\n\
-         Each row below is one (news_window, measurement_horizon, source_set) configuration.\n\
+         ## Data Quality\n\n\
+         Data-quality gates are evaluated BEFORE signal gates: a spread computed over\n\
+         unusable data is not a weak result, it is not a result at all.\n\n\
+         | metric | value | meaning |\n\
+         |---|---|---|\n\
+         | quarantine_rate | {quarantine_rate:.4} | share of articles with broken/missing timestamps. Drives `stop`. Scope exclusions (out-of-window, wrong symbol, duplicate) are NOT counted here. |\n\
+         | lexicon_hit_rate | {lexicon_hit_rate:.4} | share of articles the sentiment scorer could actually read. A low value means we are not measuring sentiment, we are measuring silence. |\n\
+         | degenerate_configurations | {degenerate_count} | configurations whose sentiment scores were too tied to separate a top from a bottom. These take ZERO trades rather than an all-long book. |\n\n\
+         See `reports/set_aside.csv` for every article that did not become an observation,\n\
+         and `reports/timestamp_audit.csv` for published_at vs available_at per article.\n\n\
+         ## Per-Configuration Verdicts\n\n\
+         Each row is one (news_window, measurement_horizon, source_set) configuration.\n\
          Configurations are never blended into a single verdict (design.md Decision 1).\n\
          Long and short sides are reported separately as well as combined (spec Backtest Rules).\n\n\
-         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | reason | degenerate | articles_per_signal | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         analyses.len(),
     );
     for analysis in analyses {
@@ -65,12 +89,15 @@ pub fn write_summary(
             })
             .unwrap_or((0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0));
         text.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
             analysis.news_window_minutes,
             analysis.measurement_horizon_minutes,
             analysis.source_set,
             analysis.observation_count,
             analysis.recommendation,
+            analysis.reason,
+            analysis.degenerate,
+            analysis.articles_per_signal,
             analysis.observed_top_minus_bottom,
             analysis.shuffled_top_minus_bottom,
             analysis.pearson_correlation,
@@ -153,7 +180,13 @@ mod tests {
                 observed_top_minus_bottom: 0.01,
                 shuffled_top_minus_bottom: 0.0,
                 pearson_correlation: 0.4,
+                quarantine_rate: 0.0,
+                articles_per_signal: 2.0,
+                source_set_coverage: 1.0,
+                lexicon_hit_rate: 0.9,
+                degenerate: false,
                 recommendation: "continue".into(),
+                reason: "observed spread beats the shuffled baseline".into(),
             },
             AnalysisSummary {
                 news_window_minutes: 240,
@@ -163,7 +196,13 @@ mod tests {
                 observed_top_minus_bottom: -0.002,
                 shuffled_top_minus_bottom: 0.001,
                 pearson_correlation: -0.1,
+                quarantine_rate: 0.0,
+                articles_per_signal: 2.0,
+                source_set_coverage: 1.0,
+                lexicon_hit_rate: 0.9,
+                degenerate: false,
                 recommendation: "revise".into(),
+                reason: "observed spread does not beat the shuffled baseline".into(),
             },
         ];
         let metrics = vec![
@@ -190,6 +229,7 @@ mod tests {
                 short_net_return_sum: 0.009,
                 short_win_rate: 0.5,
                 short_profit_factor: 1.5,
+                degenerate: false,
             },
             BacktestMetrics {
                 run_id: "stage0_fixture".into(),
@@ -214,6 +254,7 @@ mod tests {
                 short_net_return_sum: -0.002,
                 short_win_rate: 0.0,
                 short_profit_factor: 0.0,
+                degenerate: false,
             },
         ];
 

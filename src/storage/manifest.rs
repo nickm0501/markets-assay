@@ -17,8 +17,17 @@ pub struct DatasetManifestInput {
     pub schema_version: String,
     pub sources: Vec<String>,
     pub symbols: Vec<String>,
+    /// Derived from the data actually in the snapshot, never hardcoded. These
+    /// were fixture literals until Stage 1 Task 4; on real data a hardcoded
+    /// range makes the manifest silently lie, and every downstream
+    /// reproducibility claim rests on this manifest.
     pub date_start: NaiveDate,
     pub date_end: NaiveDate,
+    /// Counted apart on purpose. Quarantined = broken (drives the `stop`
+    /// verdict); excluded = out of scope (must not). Merging them would let a
+    /// sample boundary read as a data-quality failure.
+    pub quarantined_articles: u64,
+    pub excluded_articles: u64,
     pub files: Vec<FileManifest>,
 }
 
@@ -76,6 +85,8 @@ mod tests {
             symbols: vec!["SPY".into()],
             date_start: "2026-06-29".parse().unwrap(),
             date_end: "2026-07-07".parse().unwrap(),
+            quarantined_articles: 0,
+            excluded_articles: 0,
             files: vec![FileManifest {
                 relative_path: "a.parquet".into(),
                 sha256: "abc".into(),

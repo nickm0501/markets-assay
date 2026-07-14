@@ -69,4 +69,9 @@ pub struct BacktestMetrics {
     pub short_net_return_sum: f64,
     pub short_win_rate: f64,
     pub short_profit_factor: f64,
+    /// The sentiment distribution was too coarse to test, so this configuration
+    /// took NO trades. Distinct from a configuration that traded and made
+    /// nothing — an explicit flag, never a silent zero, because a reader must be
+    /// able to tell "we declined" from "we tried and it was flat".
+    pub degenerate: bool,
 }

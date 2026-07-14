@@ -21,6 +21,7 @@ pub fn run_backtests_by_configuration(
     long_quantile: f64,
     short_quantile: f64,
     cost_bps: f64,
+    max_modal_share: f64,
 ) -> Vec<BacktestResult> {
     let mut groups: BTreeMap<(i64, i64, String), Vec<&NewsSignalObservation>> = BTreeMap::new();
     for row in observations {
@@ -43,9 +44,47 @@ pub fn run_backtests_by_configuration(
                 long_quantile,
                 short_quantile,
                 cost_bps,
+                max_modal_share,
             )
         })
         .collect()
+}
+
+/// Share of observations sitting on the single most common sentiment value.
+/// Above `max_modal_share` the distribution has no usable resolution: the
+/// quantiles land on the same tied value and the long/short rule stops
+/// discriminating.
+pub fn modal_share(sentiments: &[f64]) -> f64 {
+    if sentiments.is_empty() {
+        return 0.0;
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for value in sentiments {
+        *counts.entry(format!("{value:.9}")).or_default() += 1;
+    }
+    let modal = counts.values().copied().max().unwrap_or(0);
+    modal as f64 / sentiments.len() as f64
+}
+
+/// Is this configuration's sentiment distribution too coarse to test?
+///
+/// **This guards a live defect.** The Stage 0 sentiment lexicon is 14 words, so
+/// on real headlines most articles score exactly 0.0. Both quantile thresholds
+/// then collapse to 0.0 — and because the long rule tests `>= long_threshold`,
+/// *every* neutral observation is classified long, the short branch never fires,
+/// and the run emits an all-long book with plausible-looking metrics. It fails
+/// silently, which is the worst way to fail.
+///
+/// A pipeline that cannot tell "no signal" from "no signal *resolution*" will
+/// mislead Stage 3. So: no trades, and Task 8 turns this into `expand sources`
+/// — a *data* verdict, not a signal result.
+pub fn is_degenerate(
+    sentiments: &[f64],
+    long_threshold: f64,
+    short_threshold: f64,
+    max_modal_share: f64,
+) -> bool {
+    long_threshold <= short_threshold || modal_share(sentiments) > max_modal_share
 }
 
 fn run_backtest_for_configuration(
@@ -55,15 +94,29 @@ fn run_backtest_for_configuration(
     long_quantile: f64,
     short_quantile: f64,
     cost_bps: f64,
+    max_modal_share: f64,
 ) -> BacktestResult {
-    let long_threshold = quantile(
-        observations.iter().map(|row| row.mean_sentiment).collect(),
-        long_quantile,
-    );
-    let short_threshold = quantile(
-        observations.iter().map(|row| row.mean_sentiment).collect(),
-        short_quantile,
-    );
+    let sentiments: Vec<f64> = observations.iter().map(|row| row.mean_sentiment).collect();
+    let long_threshold = quantile(sentiments.clone(), long_quantile);
+    let short_threshold = quantile(sentiments.clone(), short_quantile);
+
+    if is_degenerate(
+        &sentiments,
+        long_threshold,
+        short_threshold,
+        max_modal_share,
+    ) {
+        // Zero trades, flagged. NOT an all-long book, and not a silent zero
+        // either — a caller must be able to tell "we declined to trade this"
+        // from "we traded it and made nothing".
+        let mut metrics = metrics(run_id, key, cost_bps, &[]);
+        metrics.degenerate = true;
+        return BacktestResult {
+            metrics,
+            trades: Vec::new(),
+        };
+    }
+
     let mut last_exit_by_symbol = BTreeMap::<String, chrono::DateTime<chrono::Utc>>::new();
     let mut sorted: Vec<&NewsSignalObservation> = observations.to_vec();
     sorted.sort_by_key(|row| (row.entry_time, row.symbol.clone()));
@@ -173,6 +226,7 @@ fn metrics(
         short_net_return_sum,
         short_win_rate,
         short_profit_factor,
+        degenerate: false,
     }
 }
 
@@ -229,14 +283,16 @@ fn max_drawdown(trades: &[Trade]) -> f64 {
 mod tests {
     use super::*;
     use crate::{
-        config::Stage0Config, fixture::generate_fixture, normalize::normalize_articles,
-        observations::build_observations,
+        config::PipelineConfig, normalize::normalize_articles, observations::build_observations,
+        source::fixture::generate_fixture,
     };
 
     fn observations() -> Vec<crate::domain::observation::NewsSignalObservation> {
-        let config = Stage0Config::load("configs/stage0_fixture.json").unwrap();
+        let config = PipelineConfig::load("configs/stage0_fixture.json").unwrap();
         let fixture = generate_fixture(&config).unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap()
     }
 
@@ -251,10 +307,152 @@ mod tests {
             .unwrap()
     }
 
+    fn observation_with_sentiment(
+        mean_sentiment: f64,
+        future_return: f64,
+    ) -> NewsSignalObservation {
+        let now = chrono::Utc::now();
+        NewsSignalObservation {
+            observation_id: format!("obs-{mean_sentiment}-{future_return}"),
+            dataset_id: "ds".into(),
+            symbol: "SPY".into(),
+            signal_time: now,
+            news_window_minutes: 60,
+            measurement_horizon_minutes: 60,
+            price_interval_minutes: 60,
+            source_set: "finance_only".into(),
+            article_count: 1,
+            ticker_article_count: 1,
+            sector_theme_article_count: 0,
+            macro_article_count: 0,
+            source_count: 1,
+            publisher_count: 1,
+            mean_sentiment,
+            weighted_sentiment: mean_sentiment,
+            extreme_sentiment: mean_sentiment,
+            positive_article_count: 0,
+            negative_article_count: 0,
+            sentiment_dispersion: 0.0,
+            prior_return: 0.0,
+            prior_volatility: 0.0,
+            market_session: "regular".into(),
+            is_after_hours_signal: false,
+            future_return,
+            future_volatility: 0.0,
+            future_tail_event: false,
+            future_max_drawdown: 0.0,
+            future_max_runup: 0.0,
+            entry_time: now,
+            exit_time: now,
+            article_ids: vec![],
+            price_bar_ids: vec![],
+            created_by_run_id: "run".into(),
+        }
+    }
+
+    #[test]
+    fn a_sentiment_distribution_that_is_mostly_zero_produces_no_trades_rather_than_an_all_long_book()
+     {
+        // THE STAGE 1 DEFECT, pinned.
+        //
+        // The Stage 0 lexicon is 14 words, so real headlines mostly score 0.0.
+        // With 9 of 10 observations at 0.0, quantile(0.8) and quantile(0.2)
+        // BOTH return 0.0. The old rule then read:
+        //
+        //     if mean_sentiment >= long_threshold  -> "long"    // 0.0 >= 0.0 ✓
+        //     else if mean_sentiment <= short_threshold -> "short"  // unreachable
+        //
+        // ...so all nine neutral rows were classified LONG, the short branch
+        // never fired, and the run reported a confident all-long book with
+        // real-looking metrics. Verified failing against the pre-fix backtest.rs
+        // (9 long trades, 0 short); it must now take zero trades and say why.
+        let mut group: Vec<NewsSignalObservation> = (0..9)
+            .map(|i| observation_with_sentiment(0.0, 0.01 * i as f64))
+            .collect();
+        group.push(observation_with_sentiment(0.5, 0.02));
+
+        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].metrics.degenerate,
+            "a distribution that is 90% ties must be flagged, not traded"
+        );
+        assert_eq!(
+            results[0].metrics.trade_count, 0,
+            "expected zero trades, got an all-long book"
+        );
+        assert!(results[0].trades.is_empty());
+    }
+
+    #[test]
+    fn the_defect_is_real_the_old_rule_turns_a_tied_distribution_into_an_all_long_book() {
+        // Proof, not assertion. This replicates the EXACT pre-fix rule from
+        // backtest.rs and runs it on the degenerate distribution, so the defect
+        // is demonstrated rather than described. Delete this test only when you
+        // are willing to lose the evidence that the guard above is load-bearing.
+        let sentiments: Vec<f64> = (0..9).map(|_| 0.0).chain([0.5]).collect();
+        let long_threshold = quantile(sentiments.clone(), 0.8);
+        let short_threshold = quantile(sentiments.clone(), 0.2);
+
+        // Both quantiles land on the same tied value.
+        assert_eq!(long_threshold, 0.0);
+        assert_eq!(short_threshold, 0.0);
+
+        // The old rule, verbatim: `>=` long, then `<=` short, else flat.
+        let (mut longs, mut shorts, mut flat) = (0, 0, 0);
+        for sentiment in &sentiments {
+            if *sentiment >= long_threshold {
+                longs += 1;
+            } else if *sentiment <= short_threshold {
+                shorts += 1;
+            } else {
+                flat += 1;
+            }
+        }
+
+        // Every single row goes long. The short branch is unreachable. This
+        // book would have been reported with real-looking metrics.
+        assert_eq!(longs, 10);
+        assert_eq!(shorts, 0);
+        assert_eq!(flat, 0);
+    }
+
+    #[test]
+    fn collapsed_long_and_short_thresholds_are_detected_as_degenerate() {
+        // Every value identical: both quantiles land on the same number, so the
+        // thresholds cannot separate anything.
+        let sentiments = vec![0.0; 5];
+
+        assert!(is_degenerate(&sentiments, 0.0, 0.0, 0.8));
+    }
+
+    #[test]
+    fn a_healthy_spread_of_sentiment_values_is_not_flagged_degenerate() {
+        // The counter-test: the guard must not be so eager that it suppresses a
+        // real Stage 3 distribution. A well-spread book still trades.
+        let group: Vec<NewsSignalObservation> = (0..10)
+            .map(|i| observation_with_sentiment(i as f64 / 10.0, 0.01 * i as f64))
+            .collect();
+
+        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8);
+
+        assert!(!results[0].metrics.degenerate);
+        assert!(results[0].metrics.trade_count > 0);
+        assert!(results[0].metrics.long_count > 0);
+        assert!(results[0].metrics.short_count > 0);
+    }
+
+    #[test]
+    fn modal_share_measures_the_biggest_pile_of_tied_sentiment_values() {
+        assert!((modal_share(&[0.0, 0.0, 0.0, 0.0, 1.0]) - 0.8).abs() < 1e-9);
+        assert!((modal_share(&[0.1, 0.2, 0.3, 0.4]) - 0.25).abs() < 1e-9);
+    }
+
     #[test]
     fn backtest_takes_long_and_short_trades_within_a_configuration() {
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
         let result = finance_only_hour_hour_result(&results);
 
         assert!(result.metrics.long_count > 0);
@@ -265,7 +463,7 @@ mod tests {
     #[test]
     fn backtest_does_not_mix_trade_slots_across_configurations() {
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
 
         assert!(results.len() > 1);
         assert!(
@@ -283,9 +481,9 @@ mod tests {
     #[test]
     fn costs_reduce_net_returns() {
         let no_cost =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0, 0.8);
         let with_cost =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 10.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 10.0, 0.8);
         let no_cost_total: f64 = no_cost
             .iter()
             .map(|result| result.metrics.net_return_sum)
@@ -301,7 +499,7 @@ mod tests {
     #[test]
     fn short_trade_profit_uses_negative_future_return() {
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0, 0.8);
         let profitable_short = results
             .iter()
             .flat_map(|result| result.trades.iter())
@@ -317,7 +515,7 @@ mod tests {
         // well as combined." The combined fields must always equal the sum
         // of the long-only and short-only fields for the same trade set.
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0);
+            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
         let result = finance_only_hour_hour_result(&results);
         let metrics = &result.metrics;
 
@@ -350,14 +548,16 @@ mod tests {
         // "long" (threshold == the group's minimum sentiment), so the trade
         // outcome does not depend on the rest of the fixture's sentiment
         // distribution.
-        let config = Stage0Config::load("configs/stage0_fixture.json").unwrap();
+        let config = PipelineConfig::load("configs/stage0_fixture.json").unwrap();
         let fixture = generate_fixture(&config).unwrap();
         let raw = fixture
             .raw_articles
             .iter()
             .find(|article| article.vendor_id == "massive-1")
             .unwrap();
-        let articles = normalize_articles(&config, &fixture.raw_articles).unwrap();
+        let articles = normalize_articles(&config, &fixture.raw_articles)
+            .unwrap()
+            .normalized;
         let normalized = articles
             .iter()
             .find(|article| article.vendor_id == "massive-1")
@@ -379,7 +579,7 @@ mod tests {
         assert_eq!(observation.article_ids, vec![normalized.article_id.clone()]);
 
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations, 0.0, 0.0, 5.0);
+            run_backtests_by_configuration("stage0_fixture", &observations, 0.8, 0.2, 5.0, 0.8);
         let trade = results
             .iter()
             .flat_map(|result| result.trades.iter())
