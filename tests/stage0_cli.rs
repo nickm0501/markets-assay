@@ -42,6 +42,166 @@ fn run_accepts_checked_in_stage0_config() {
     .stdout(predicate::str::contains("dry_run=true"));
 }
 
+/// The fixture's snapshot ids, pinned.
+///
+/// `dataset_id` is a content hash, so it is *supposed* to move when the
+/// snapshot's contents change — and to stay put when they do not. That makes it
+/// a precise tripwire, but only if every change to it is deliberate. Do not
+/// update these constants to make a red test go green: work out which change
+/// moved the hash and confirm you meant it. Changelog:
+///
+/// | id                  | why it moved                                       |
+/// |---------------------|----------------------------------------------------|
+/// | ds_9fc5b9a291fd38fd | Stage 0 baseline.                                  |
+/// | ds_9fc5b9a291fd38fd | Task 1 (swappable sources) — UNCHANGED, as intended.|
+/// | ds_32872c03f39b4cd6 | Task 2 + 4: set_aside_articles.parquet added to the |
+/// |                     | manifest; quarantined/excluded counts added; date   |
+/// |                     | bounds now derived rather than hardcoded.          |
+/// | ds_963e4e90a5a10027 | Real-data fixes: the domain enums now serialize as  |
+/// |                     | strings, so their Parquet column type changed from  |
+/// |                     | Dictionary to Utf8 (the old schema depended on      |
+/// |                     | WHICH enum variants the data happened to contain,   |
+/// |                     | and broke on real data that never produced a        |
+/// |                     | SectorTheme article). Plus RELEVANCE_RULE_VERSION   |
+/// |                     | bumped to stage1_relevance_v2 for the               |
+/// |                     | constituent->ETF mapping.                          |
+///
+/// Through every one of these, the fixture's VERDICTS never moved: 6
+/// configurations, 5 `continue`, 1 `revise`. That is the invariant that matters.
+/// The ids are a content hash and are *supposed* to move when the bytes change.
+const FIXTURE_DATASET_ID: &str = "ds_963e4e90a5a10027";
+const FIXTURE_OBSERVATION_SET_ID: &str = "obs_522f739a42faf2d0";
+
+/// The research loop's output must be unmoved by all of Stage 1's plumbing
+/// work. If the *verdicts* ever change, the refactor broke the science, not
+/// just the storage layout — and that is a different and much worse bug than a
+/// moved hash.
+#[test]
+fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
+    let temp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    cmd.args([
+        "run",
+        "--config",
+        "configs/stage0_fixture.json",
+        "--output-root",
+        temp.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(format!(
+        "dataset_id={FIXTURE_DATASET_ID}"
+    )))
+    .stdout(predicate::str::contains(format!(
+        "observation_set_id={FIXTURE_OBSERVATION_SET_ID}"
+    )))
+    .stdout(predicate::str::contains("configurations=6"))
+    // One line per verdict value that actually occurred. `run_all` used to
+    // print "revise" as `total - continue`, which folded stop/expand data/
+    // expand sources into `revise` the moment the full vocabulary existed.
+    .stdout(predicate::str::contains("decisions_continue=5"))
+    .stdout(predicate::str::contains("decisions_revise=1"));
+}
+
+/// Task 9: the leakage check and inspection tables run on every invocation, not
+/// only in unit tests. On the real sample these are the deliverable — Stage 1 is
+/// named "timestamp and leakage inspection", and inspection needs a table.
+#[test]
+fn a_run_writes_the_timestamp_audit_and_set_aside_reports() {
+    let temp = TempDir::new().unwrap();
+    Command::cargo_bin("markets")
+        .unwrap()
+        .args([
+            "run",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let reports = temp.path().join("runs/stage0_fixture/reports");
+    let audit = std::fs::read_to_string(reports.join("timestamp_audit.csv")).unwrap();
+    let set_aside = std::fs::read_to_string(reports.join("set_aside.csv")).unwrap();
+
+    // The fixture's after-hours article (published 21:15 UTC) must show as
+    // deferred — that column is where a timezone or DST bug becomes visible.
+    assert!(audit.contains("was_deferred"));
+    assert!(audit.contains("gdelt-2"));
+    assert!(audit.contains("true"));
+    // The syndicated duplicate is EXCLUDED (scope), not quarantined (quality).
+    assert!(set_aside.contains("massive-1-dup"));
+    assert!(set_aside.contains("excluded"));
+    assert!(set_aside.contains("duplicate"));
+    assert!(!set_aside.contains("quarantined"));
+}
+
+/// The spec's architecture lists `ingest` as its own stage; Stage 0 never built
+/// it, so the fixture generator was the only way to produce a snapshot.
+#[test]
+fn ingest_builds_a_snapshot_from_the_configured_source() {
+    let temp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    cmd.args([
+        "ingest",
+        "--config",
+        "configs/stage0_fixture.json",
+        "--output-root",
+        temp.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(format!(
+        "dataset_id={FIXTURE_DATASET_ID}"
+    )));
+
+    assert!(
+        temp.path()
+            .join(format!("data/datasets/{FIXTURE_DATASET_ID}/manifest.json"))
+            .exists()
+    );
+}
+
+/// Task 4: the manifest's date bounds were fixture literals
+/// (`2026-06-29`/`2026-07-07`) hardcoded in `pipeline.rs`. They are now derived
+/// from the data actually in the snapshot. Deriving them must reproduce those
+/// literals exactly for the fixture — which proves the fix is a no-op on the
+/// fixture path while being *correct* on real data, where a hardcoded range
+/// would have made the manifest silently lie.
+#[test]
+fn the_manifest_date_range_is_derived_from_data_and_reproduces_the_fixture_window() {
+    let temp = TempDir::new().unwrap();
+    Command::cargo_bin("markets")
+        .unwrap()
+        .args([
+            "ingest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            temp.path()
+                .join(format!("data/datasets/{FIXTURE_DATASET_ID}/manifest.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(manifest["date_start"], "2026-06-29");
+    assert_eq!(manifest["date_end"], "2026-07-07");
+    // The fixture's one syndicated duplicate: excluded (scope), not
+    // quarantined (quality). Merging these counters would let a sample
+    // boundary trip the `stop` verdict.
+    assert_eq!(manifest["quarantined_articles"], 0);
+    assert_eq!(manifest["excluded_articles"], 1);
+}
+
 #[test]
 fn fixture_command_prints_generated_record_counts() {
     let temp = TempDir::new().unwrap();

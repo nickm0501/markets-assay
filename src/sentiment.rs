@@ -8,25 +8,47 @@ pub struct SentimentResult {
 
 pub const SENTIMENT_VERSION: &str = "stage0_lexicon_v1";
 
+/// Does this text contain ANY word the lexicon knows?
+///
+/// The lexicon is 14 words. On real headlines it will miss most of them, and a
+/// miss scores exactly 0.0 — indistinguishable from a genuinely neutral article.
+/// Aggregate enough of those and the sentiment distribution collapses into ties,
+/// the quantile thresholds stop separating anything, and the backtest silently
+/// degenerates (see `backtest::is_degenerate`).
+///
+/// So the miss rate is not a curiosity, it is a first-class data-quality signal:
+/// it is the difference between "the news is neutral" and "we cannot read the
+/// news". Task 8 turns a low hit rate into an `expand sources` verdict.
+pub fn has_lexicon_hit(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|token| POSITIVE.contains(&token) || NEGATIVE.contains(&token))
+}
+
+const POSITIVE: [&str; 7] = [
+    "strong",
+    "breakout",
+    "boosts",
+    "relief",
+    "positive",
+    "constructive",
+    "growth",
+];
+
+const NEGATIVE: [&str; 7] = [
+    "weak",
+    "downgrade",
+    "negative",
+    "shock",
+    "weighs",
+    "surprise",
+    "hawkish",
+];
+
 pub fn score_text(text: &str) -> SentimentResult {
-    let positive = [
-        "strong",
-        "breakout",
-        "boosts",
-        "relief",
-        "positive",
-        "constructive",
-        "growth",
-    ];
-    let negative = [
-        "weak",
-        "downgrade",
-        "negative",
-        "shock",
-        "weighs",
-        "surprise",
-        "hawkish",
-    ];
+    let positive = POSITIVE;
+    let negative = NEGATIVE;
     let lower = text.to_lowercase();
     let mut score = 0.0;
     for token in lower.split(|c: char| !c.is_ascii_alphabetic()) {
