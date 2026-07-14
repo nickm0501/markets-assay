@@ -123,6 +123,49 @@ quarantine path is correct but was not exercised by this sample.
 
 ---
 
+## The hand-trace (spec: Required Tests)
+
+One real article, followed from the vendor's raw JSON to the trade it caused.
+Pinned as `tests/stage1_real_sample.rs`, so it cannot silently rot.
+
+**The Motley Fool — "Which AI Stocks May Soar After Reaching Record Highs?"**, tagged
+`[AVGO]`, published `2025-07-01T08:10:00Z`.
+
+| step | value |
+|---|---|
+| **published_at** | `08:10Z` — 04:10 ET, **overnight, market shut** |
+| **available_at** | `13:30Z` — deferred 320 min to the session open |
+| **sentiment** | **+0.5** — the lexicon found exactly two words it knows, `growth` and `strong`, in the description (`+2/4`) |
+| **signal_time** | `14:00Z` (10:00 ET, a regular-session bar). The 60-min window is `(13:00Z, 14:00Z]`, and `13:30Z` falls inside it |
+| **entry bar** | AVGO `14:00Z`: open **269.69** → close **263.95** |
+| **future_return** | `(263.95 − 269.69) / 269.69` = **−0.02128** |
+| **trade** | **LONG** (sentiment cleared the top quantile). Gross **−2.13%**, net **−2.23%** after 10bps |
+
+Two things this makes concrete that no aggregate could:
+
+1. **The article reached the signal *because* it was deferred, not despite it.** Published
+   overnight, it could not inform anything until the market opened. `available_at` is what
+   put it in the 14:00Z window. Decision 4's machinery is not a corner case here — it is
+   the mechanism by which most of this dataset works at all.
+
+2. **The scorer read the headline "Which AI Stocks May Soar After Reaching Record Highs?"
+   and scored it strongly positive on the strength of two tokens.** It has no idea what the
+   article says. It went long. AVGO fell 2.1% in the hour. This single row *is* the S1-C
+   argument.
+
+## The Decision Demo (spec §Decision Demo)
+
+Verified on the real sample: ingest once → backtest at 0bps → change **one** cost
+assumption → rerun at 10bps **without re-ingesting** (same `observation_set_id`) → compare
+both runs side by side. `--run-id` keeps the two runs' reports separate, so they can
+actually be compared rather than one overwriting the other.
+
+Costs behave exactly as arithmetic demands — e.g. `finance_only w=240` loses `0.104` more
+at 10bps across 104 trades, which is `104 × 0.001`.
+
+Every configuration was already losing money before costs. Costs make it worse. Verdict
+across the board: **`revise`**.
+
 ## Three bugs real data found that the plan did not anticipate
 
 1. **Massive tags news to companies, not ETFs.** Only **4 of 677** articles in the week

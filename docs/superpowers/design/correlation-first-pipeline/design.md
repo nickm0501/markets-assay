@@ -30,6 +30,33 @@ here.
   states later stages reuse the analysis/backtest/report loop unchanged and
   only swap the data source — so whatever grain Stage 0 bakes into that loop
   becomes the grain for every later stage.
+- **Stage 1's real-data findings (2026-07-14)** — the answers only the payloads
+  could give, now recorded in `fixtures/saved_sample/README.md`:
+  - **S1-A: Alpaca hourly bars are clock-aligned (`:00`) and include pre/post
+    market.** The feared mass-drop from grid misalignment does *not* happen —
+    `signal_time` is derived from the bar, so the signal grid *is* the bar grid.
+    But two real bugs did: non-regular bars could open trades (including a
+    `13:00Z` bar whose `open` is a 09:00 ET pre-market price that never traded
+    in-session), and — worse — with after-hours bars now available, the
+    contiguity check would have **silently bridged the session close**,
+    reversing Decision 3. Both fixed; entry *and* measurement bars must now be
+    regular-session.
+  - **S1-B: no syndication.** 0 of 132 distinct titles appear under more than one
+    URL. The planned near-duplicate work is **not needed** and was not built.
+    (Dedupe still does real work: 85 exact duplicates, a fetch artifact of
+    querying per-ticker.)
+  - **S1-C: the sentiment lexicon reads 1 headline in 5** (`lexicon_hit_rate =
+    0.2021`). This is the Stage 2 blocker. See Next.
+  - **79% of articles (301/381) are published outside the regular session**,
+    median deferral ~14 hours. Financial news is written overnight: the
+    after-hours deferral rule is the *common path*, governing the majority of
+    every signal, not an edge case. The fixture had 1 deferred article of 5 and
+    badly under-represented it.
+  - **Zero quarantined articles.** Every real timestamp parsed. The quarantine
+    path is correct but was not exercised by this sample.
+  - **Result: all 6 configurations returned `revise`.** No signal — as expected
+    from 5 days and a scorer that cannot read most of the news. **These numbers
+    are mechanically valid and statistically meaningless.**
 - Stage 1 Tasks 1-4 and 7-9 are **implemented** as of 2026-07-14. `cargo fmt`,
   `cargo clippy --all-targets -- -D warnings`, and all 93 tests (78 lib + 15
   CLI) pass; the fixture path still produces 6 per-configuration verdicts
@@ -95,11 +122,15 @@ here.
 
 ### Current Phase
 
-- active: Stage 1 implementation — Tasks 1-4 and 7-9 are done and green. Tasks
-  5, 6, and 10 are **blocked on the user running `scripts/fetch_sample.sh`**
-  with their Massive/Alpaca API keys; those tasks are investigations whose
-  answers only the real payloads hold (S1-A bar alignment, S1-B syndication),
-  plus the end-to-end demo.
+- done: **Stage 1 is complete** (2026-07-14). All 10 tasks. The real sample is
+  fetched, committed, and running; 95 tests green; the Decision Demo and the
+  spec's hand-trace Required Test both pass on real data. Findings in
+  `fixtures/saved_sample/README.md`.
+- active: **Direction/Design for Stage 2** — not yet started. Stage 2 is the
+  spec's "narrow Massive/GDELT/Alpaca source probe", but Stage 1 has already
+  *done* the probing (see Known), so Stage 2's real content is now: replace the
+  sentiment scorer, build the 4 baselines, and add the live-API source behind
+  the existing trait. That reframing needs a design pass before a plan.
 - done: Development Handoff (Stage 1) — plan reviewed via Lavish, four
   annotations applied (one of which, the quarantine/exclusion split, found a
   real defect in the design before any code was written — see Decision 15).
@@ -116,18 +147,33 @@ here.
 
 ### Next
 
-- **User action required:** run `scripts/fetch_sample.sh` (needs
-  `MASSIVE_API_KEY`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`), read the
-  payloads, and fill in `fixtures/saved_sample/README.md`. The reading *is* the
-  Stage 1 deliverable — the spec names this stage "timestamp and leakage
-  inspection", and no amount of passing tests substitutes for looking at the
-  data. Tasks 5, 6, and 10 unblock from there.
-- Stage 1 closes half of Decision 6's gate — the full 5-value decision
-  vocabulary now exists and every value is reachable and tested. The other half
-  (the 4 baselines) stays deliberately deferred and now gates Stage 2/3 alone
-  (Decision 14).
-- The 1-year-holdout sufficiency question (Open Questions) still stands and
-  still blocks Stage 3, not Stage 1.
+Three things now gate Stage 3's go/no-go. They are the whole of Stage 2:
+
+1. **Replace the sentiment scorer.** This is the blocker, and Stage 1 measured
+   it rather than guessed it: `lexicon_hit_rate = 0.2021`. The 14-word lexicon
+   understands one real headline in five; the other 80% score exactly `0.0`,
+   indistinguishable from genuinely neutral news. It cleared its own gate by
+   0.002 — luck, not health. **Every downstream result is meaningless until this
+   is fixed**, because we are not currently measuring sentiment, we are
+   measuring silence. See S1-C and the hand-trace in
+   `fixtures/saved_sample/README.md`: the scorer read "Which AI Stocks May Soar
+   After Reaching Record Highs?" and scored it strongly positive on the strength
+   of two tokens.
+2. **Build the 4 baselines** (always-flat, random, prior-return momentum;
+   shuffled already exists). This is the other half of Decision 6's gate, still
+   open, and it must exist before any report is used for a real go/no-go.
+3. **Add the live-API source** behind the `NewsSource`/`PriceSource` trait, with
+   rate limiting and retries. Stage 1 hit 429s from *both* Massive and GDELT;
+   the throwaway fetch script handles them, but application code will need to do
+   it properly. Note the trait seam means this touches no research code.
+
+The spec calls Stage 2 a "narrow Massive/GDELT/Alpaca source probe" — but Stage
+1 has already probed those sources and returned answers (see Known). Stage 2's
+real content is the three items above, and that reframing deserves a design pass
+before a plan.
+
+The 1-year-holdout sufficiency question (Open Questions) still stands and still
+blocks Stage 3.
 
 ## Description
 

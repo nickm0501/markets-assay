@@ -549,6 +549,18 @@ pub fn run_backtest_command(
         .collect();
     write_csv(&report_dir.join("backtest_metrics.csv"), &metrics)?;
     write_csv(&report_dir.join("trade_log.csv"), &trades)?;
+    // The leakage check lives in write_audit_reports, so it must run here too.
+    // Without this, `backtest` was the one path that could produce a trade log
+    // WITHOUT ever verifying no-lookahead — and a trade log is exactly the
+    // artifact somebody would believe.
+    let observation_manifest: ObservationSetManifest =
+        serde_json::from_slice(&fs::read(observation_dir.join("manifest.json"))?)?;
+    write_audit_reports(
+        &root,
+        run_id,
+        &observation_manifest.input.dataset_id,
+        &observations,
+    )?;
     write_run_manifests(config, &root, run_id, observation_set_id)?;
     println!(
         "backtest_configurations={} backtest_trades={}",
