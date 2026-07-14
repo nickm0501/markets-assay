@@ -88,7 +88,17 @@ pub fn run_cli() -> Result<()> {
                 &args.dataset_id,
             )
         }
-        Commands::Analyze(args) => print_loaded_config(args.stage, "analyze"),
+        Commands::Analyze(args) => {
+            let config = Stage0Config::load(&args.stage.config)?;
+            let run_id = args.run_id.clone().unwrap_or_else(|| config.run_id.clone());
+            pipeline::run_analyze(
+                &config,
+                args.stage.output_root,
+                args.stage.dry_run,
+                &args.observation_set_id,
+                &run_id,
+            )
+        }
         Commands::Backtest(args) => print_loaded_config(args.observation.stage, "backtest"),
     }
 }

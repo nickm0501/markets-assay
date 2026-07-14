@@ -157,3 +157,63 @@ fn run_fixture_and_extract_dataset_id(root: &std::path::Path) -> String {
         .unwrap()
         .to_string()
 }
+
+#[test]
+fn analyze_writes_reusable_report_tables() {
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id =
+        run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    cmd.args([
+        "analyze",
+        "--config",
+        "configs/stage0_fixture.json",
+        "--output-root",
+        temp.path().to_str().unwrap(),
+        "--observation-set-id",
+        &observation_set_id,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("analysis_configurations="));
+
+    let reports = temp.path().join("runs/stage0_fixture/reports");
+    assert!(reports.join("coverage.csv").exists());
+    assert!(reports.join("bucket_returns.csv").exists());
+    assert!(reports.join("analysis_summary.json").exists());
+
+    let run_dir = temp.path().join("runs/stage0_fixture");
+    assert!(run_dir.join("config.json").exists());
+    assert!(run_dir.join("dataset_manifest.json").exists());
+    assert!(run_dir.join("observation_set_manifest.json").exists());
+}
+
+fn run_build_observations_and_extract_observation_set_id(
+    root: &std::path::Path,
+    dataset_id: &str,
+) -> String {
+    let mut cmd = Command::cargo_bin("markets").unwrap();
+    let output = cmd
+        .args([
+            "build-observations",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            root.to_str().unwrap(),
+            "--dataset-id",
+            dataset_id,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output)
+        .unwrap()
+        .trim()
+        .strip_prefix("observation_set_id=")
+        .unwrap()
+        .to_string()
+}

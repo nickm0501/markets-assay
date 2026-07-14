@@ -1,8 +1,10 @@
 use crate::{
+    analysis::{analyze_observations, bucket_return_rows, coverage_rows},
     config::Stage0Config,
     domain::{
         article::{NormalizedArticle, SourceKind},
         market::PriceBar,
+        observation::NewsSignalObservation,
     },
     fixture::generate_fixture,
     normalize::{RELEVANCE_RULE_VERSION, normalize_articles},
@@ -17,10 +19,14 @@ use crate::{
         parquet::{read_parquet, write_parquet},
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::Serialize;
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceCatalogRow {
@@ -187,5 +193,125 @@ pub fn run_build_observations(
         serde_json::to_string_pretty(&manifest)?,
     )?;
     println!("observation_set_id={id}");
+    Ok(())
+}
+
+pub fn run_analyze(
+    config: &Stage0Config,
+    output_root: Option<PathBuf>,
+    dry_run: bool,
+    observation_set_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
+    let observation_dir = root
+        .join("data")
+        .join("observation_sets")
+        .join(observation_set_id);
+    let observations: Vec<NewsSignalObservation> =
+        read_parquet(&observation_dir.join("news_signal_observations.parquet"))?;
+    let summaries = analyze_observations(&observations);
+    let continue_count = summaries
+        .iter()
+        .filter(|summary| summary.recommendation == "continue")
+        .count();
+    if dry_run {
+        println!(
+            "analysis dry_run=true configurations={} continue={}",
+            summaries.len(),
+            continue_count
+        );
+        return Ok(());
+    }
+    let report_dir = root.join("runs").join(run_id).join("reports");
+    fs::create_dir_all(&report_dir)?;
+    write_csv(
+        &report_dir.join("coverage.csv"),
+        &coverage_rows(&observations),
+    )?;
+    write_csv(
+        &report_dir.join("bucket_returns.csv"),
+        &bucket_return_rows(&observations, 3),
+    )?;
+    fs::write(
+        report_dir.join("analysis_summary.json"),
+        serde_json::to_string_pretty(&summaries)?,
+    )?;
+    write_run_manifests(config, &root, run_id, observation_set_id)?;
+    println!(
+        "analysis_configurations={} analysis_continue={}",
+        summaries.len(),
+        continue_count
+    );
+    Ok(())
+}
+
+fn write_csv<T: serde::Serialize>(path: &Path, rows: &[T]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut writer = csv::Writer::from_path(path)?;
+    for row in rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Writes `runs/<run_id>/config.json`, `dataset_manifest.json`, and
+/// `observation_set_manifest.json`, per the spec's Stored Data section
+/// ("Each run lives under runs/<run_id>/: config.json, dataset_manifest.json,
+/// observation_set_manifest.json, reports/..."). Shared by `run_analyze`
+/// (this task), `run_backtest_command` (Task 8), and `run_all` (Task 9) —
+/// all three write into `runs/<run_id>/` and must keep these files current.
+/// `config.json` records the *effective* `run_id` actually used for this
+/// invocation (which may differ from `config.run_id` when the caller passed
+/// `--run-id`, see Task 1 Step 8's CLI changes), not the raw value loaded
+/// from the config file, so the file on disk matches the directory it lives
+/// in.
+fn write_run_manifests(
+    config: &Stage0Config,
+    root: &Path,
+    run_id: &str,
+    observation_set_id: &str,
+) -> Result<()> {
+    let observation_dir = root
+        .join("data")
+        .join("observation_sets")
+        .join(observation_set_id);
+    let observation_manifest_bytes =
+        fs::read(observation_dir.join("manifest.json")).with_context(|| {
+            format!("failed to read observation set manifest for {observation_set_id}")
+        })?;
+    let observation_manifest: crate::storage::manifest::ObservationSetManifest =
+        serde_json::from_slice(&observation_manifest_bytes)?;
+    let dataset_dir = root
+        .join("data")
+        .join("datasets")
+        .join(&observation_manifest.input.dataset_id);
+    let dataset_manifest_bytes =
+        fs::read(dataset_dir.join("manifest.json")).with_context(|| {
+            format!(
+                "failed to read dataset manifest for {}",
+                observation_manifest.input.dataset_id
+            )
+        })?;
+
+    let run_dir = root.join("runs").join(run_id);
+    fs::create_dir_all(&run_dir)?;
+    let mut config_snapshot = config.clone();
+    config_snapshot.run_id = run_id.to_string();
+    fs::write(
+        run_dir.join("config.json"),
+        serde_json::to_string_pretty(&config_snapshot)?,
+    )?;
+    fs::write(
+        run_dir.join("dataset_manifest.json"),
+        &dataset_manifest_bytes,
+    )?;
+    fs::write(
+        run_dir.join("observation_set_manifest.json"),
+        &observation_manifest_bytes,
+    )?;
     Ok(())
 }
