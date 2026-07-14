@@ -550,3 +550,45 @@ fn full_pipeline_reuses_snapshot_for_multiple_backtests() {
         .unwrap();
     assert_eq!(before, after);
 }
+
+/// The no-lookahead check lives in `write_audit_reports`. `backtest` was the one
+/// command that produced a trade log WITHOUT calling it — and a trade log is
+/// exactly the artifact somebody would believe. Every command that emits results
+/// must first verify that no observation used information that did not exist yet.
+#[test]
+fn a_standalone_backtest_still_runs_the_leakage_check() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_str().unwrap();
+
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id =
+        run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    Command::cargo_bin("markets")
+        .unwrap()
+        .args([
+            "backtest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            root,
+            "--observation-set-id",
+            &observation_set_id,
+            "--run-id",
+            "backtest_only",
+            "--cost-bps",
+            "5",
+        ])
+        .assert()
+        .success();
+
+    // These two files are written by `write_audit_reports`, which calls
+    // `assert_no_lookahead` first. Their presence is the evidence the check ran.
+    let reports = temp.path().join("runs/backtest_only/reports");
+    assert!(
+        reports.join("timestamp_audit.csv").exists(),
+        "backtest must run the leakage check, not just emit a trade log"
+    );
+    assert!(reports.join("set_aside.csv").exists());
+    assert!(reports.join("trade_log.csv").exists());
+}
