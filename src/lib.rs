@@ -7,5 +7,6 @@ pub mod ids;
 pub mod normalize;
 pub mod pipeline;
 pub mod sentiment;
+pub mod storage;
 
 pub use cli::run_cli;
