@@ -20,6 +20,10 @@ pub struct AnalysisSummary {
     pub observation_count: u32,
     pub observed_top_minus_bottom: f64,
     pub shuffled_top_minus_bottom: f64,
+    /// 95th percentile of the null distribution. `continue` requires beating the
+    /// MEAN (the spec's literal bar); this column tells a reader whether the
+    /// result would also survive a real significance test.
+    pub shuffled_p95: f64,
     pub pearson_correlation: f64,
     pub quarantine_rate: f64,
     pub articles_per_signal: f64,
@@ -57,6 +61,7 @@ pub struct AnalysisContext {
     pub long_quantile: f64,
     pub short_quantile: f64,
     pub max_modal_share: f64,
+    pub seed: u64,
     pub thresholds: VerdictThresholds,
     /// Per configuration: (sentiment net return, best baseline net return, its
     /// name). Computed by running all five strategies through the same backtest
@@ -170,7 +175,7 @@ pub fn analyze_observations(
             // continue/revise verdict isolates the sentiment ordering, not a difference
             // in how the two spreads carve up the group.
             let observed = top_minus_bottom(&sentiment_return_pairs(&group));
-            let shuffled = shuffled_spread(&group);
+            let (shuffled, shuffled_p95) = shuffled_spread(&group, context.seed);
 
             let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
             let degenerate = is_degenerate(
@@ -226,6 +231,7 @@ pub fn analyze_observations(
             let signal = SignalMetrics {
                 observed_top_minus_bottom: observed,
                 shuffled_top_minus_bottom: shuffled,
+                shuffled_p95,
                 observation_count: group.len() as u32,
                 sentiment_net_return: sentiment_net,
                 best_baseline_net_return: best_baseline_net,
@@ -240,6 +246,7 @@ pub fn analyze_observations(
                 observation_count: group.len() as u32,
                 observed_top_minus_bottom: observed,
                 shuffled_top_minus_bottom: shuffled,
+                shuffled_p95,
                 pearson_correlation: pearson(&group),
                 quarantine_rate: quality.quarantine_rate,
                 articles_per_signal: quality.articles_per_signal,
@@ -287,17 +294,69 @@ fn top_minus_bottom(pairs: &[(f64, f64)]) -> f64 {
     high - low
 }
 
-fn shuffled_spread(group: &[&NewsSignalObservation]) -> f64 {
+/// How many permutations to build the null distribution from.
+///
+/// One permutation is not a null distribution, it is one sample from it — and a
+/// noisy one. The bar that `continue` must clear should not itself be a coin flip.
+const NULL_PERMUTATIONS: usize = 200;
+
+/// The null hypothesis: sentiment scores paired with the WRONG returns.
+///
+/// **This was a live bug from Stage 0 until 2026-07-14.** The old implementation
+/// was `sentiments[(idx + 1) % len]` — a *rotation by one*, not a shuffle. It
+/// paired each return with its NEIGHBOUR's sentiment, and neighbouring
+/// observations have similar sentiment. Worse, the more observations you have,
+/// the closer adjacent sentiments get: at n=500 they differ by 0.004. So the
+/// "null" converged on the real hypothesis as the sample grew, the margin
+/// collapsed to zero, and **a genuine signal was rejected more readily the more
+/// evidence you gave it**. A power sweep caught it: detection got *worse* with
+/// more data, which is impossible for a sound detector.
+///
+/// A real shuffle destroys the article↔return pairing while preserving the score
+/// *distribution*, which is precisely what isolates whether the ORDERING carries
+/// information.
+///
+/// Returns the mean spread across `NULL_PERMUTATIONS` shuffles, and the 95th
+/// percentile — the bar a result would need to clear to be significant rather
+/// than merely lucky.
+fn shuffled_spread(group: &[&NewsSignalObservation], seed: u64) -> (f64, f64) {
     if group.len() < 3 {
-        return 0.0;
+        // Not a baseline — an admission that we cannot compute one. The verdict's
+        // `min_observations` gate exists so this value is never actually compared
+        // against anything.
+        return (0.0, 0.0);
     }
     let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
-    let shuffled_pairs: Vec<(f64, f64)> = group
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| (sentiments[(idx + 1) % sentiments.len()], row.future_return))
-        .collect();
-    top_minus_bottom(&shuffled_pairs)
+    let returns: Vec<f64> = group.iter().map(|row| row.future_return).collect();
+
+    let mut spreads = Vec::with_capacity(NULL_PERMUTATIONS);
+    for permutation in 0..NULL_PERMUTATIONS {
+        let mut shuffled = sentiments.clone();
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(permutation as u64);
+        // Fisher-Yates. A real permutation, not a rotation.
+        for i in (1..shuffled.len()).rev() {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let j = (z % (i as u64 + 1)) as usize;
+            shuffled.swap(i, j);
+        }
+        let pairs: Vec<(f64, f64)> = shuffled
+            .iter()
+            .copied()
+            .zip(returns.iter().copied())
+            .collect();
+        spreads.push(top_minus_bottom(&pairs));
+    }
+
+    let mean_spread = spreads.iter().sum::<f64>() / spreads.len() as f64;
+    spreads.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p95 = spreads[((spreads.len() as f64 * 0.95) as usize).min(spreads.len() - 1)];
+    (mean_spread, p95)
 }
 
 fn pearson(group: &[&NewsSignalObservation]) -> f64 {
@@ -354,6 +413,7 @@ mod tests {
             ]),
             article_sources: BTreeMap::new(),
             strategy_nets: BTreeMap::new(),
+            seed: 42,
             long_quantile: 0.8,
             short_quantile: 0.2,
             max_modal_share: 1.0,

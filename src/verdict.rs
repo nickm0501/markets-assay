@@ -25,7 +25,12 @@ pub struct DataQualityMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignalMetrics {
     pub observed_top_minus_bottom: f64,
+    /// MEAN of the null distribution. Reported, but NOT the bar — by definition
+    /// half of all pure-noise draws beat the mean of their own null.
     pub shuffled_top_minus_bottom: f64,
+    /// 95th percentile of the null distribution: the spread that 95% of random
+    /// permutations fail to reach. THIS is the bar. Beating it means p < 0.05.
+    pub shuffled_p95: f64,
     /// How many observations the spread was computed from. A spread from two
     /// rows is not a weak result — it is not a result.
     pub observation_count: u32,
@@ -133,18 +138,32 @@ pub fn verdict(
     // a different order, and three fixture configurations reported `continue` on
     // the strength of a 1e-18 difference. An edge you can only see past the 15th
     // decimal place is not an edge, it is rounding.
-    let margin = signal.observed_top_minus_bottom - signal.shuffled_top_minus_bottom;
+    // THE SIGNIFICANCE GATE.
+    //
+    // The bar is the 95th PERCENTILE of the null distribution, not its mean.
+    //
+    // This is not a refinement, it is a correctness fix. Comparing against the
+    // MEAN of the null is a coin flip: by construction, ~50% of pure-noise draws
+    // beat the mean of their own null distribution. A power sweep confirmed it —
+    // the pipeline reported `continue` on data with ZERO planted signal. A gate
+    // that fires half the time on noise is not a gate.
+    //
+    // Beating 95% of random permutations of your own scores is a real test: it
+    // means p < 0.05 against the null that sentiment ordering carries no
+    // information.
+    let margin = signal.observed_top_minus_bottom - signal.shuffled_p95;
     if margin <= thresholds.min_spread_margin
         || signal.observed_top_minus_bottom <= thresholds.min_spread_margin
     {
         return decide(
             "revise",
             format!(
-                "observed spread {:.8} does not beat the shuffled baseline {:.8} by a meaningful margin (got {:.8}, need > {:.8})",
+                "observed spread {:.8} does not clear the null's 95th percentile {:.8} by a meaningful margin (got {:.8}, need > {:.8}); null mean was {:.8}",
                 signal.observed_top_minus_bottom,
-                signal.shuffled_top_minus_bottom,
+                signal.shuffled_p95,
                 margin,
-                thresholds.min_spread_margin
+                thresholds.min_spread_margin,
+                signal.shuffled_top_minus_bottom
             ),
         );
     }
@@ -177,9 +196,9 @@ pub fn verdict(
     decide(
         "continue",
         format!(
-            "observed spread {:.8} beats the shuffled baseline {:.8} by {:.8}, AND sentiment net {:.6} beats its best baseline ({} at {:.6})",
+            "observed spread {:.8} clears the null's 95th percentile {:.8} by {:.8} (p < 0.05), AND sentiment net {:.6} beats its best baseline ({} at {:.6})",
             signal.observed_top_minus_bottom,
-            signal.shuffled_top_minus_bottom,
+            signal.shuffled_p95,
             margin,
             signal.sentiment_net_return,
             signal.best_baseline_name,
@@ -206,6 +225,7 @@ mod tests {
         SignalMetrics {
             observed_top_minus_bottom: 0.01,
             shuffled_top_minus_bottom: 0.001,
+            shuffled_p95: 0.002,
             observation_count: 100,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
@@ -224,14 +244,17 @@ mod tests {
         // place is rounding, not signal.
         let noise = SignalMetrics {
             observed_top_minus_bottom: 0.0032000000000000004,
-            shuffled_top_minus_bottom: 0.0032,
+            shuffled_top_minus_bottom: 0.0031,
+            // The observed spread sits exactly ON the null's 95th percentile —
+            // it "clears" it only in float terms, by 4e-19.
+            shuffled_p95: 0.0032,
             observation_count: 100,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
             best_baseline_name: "prior_return_momentum".to_string(),
         };
         assert!(
-            noise.observed_top_minus_bottom > noise.shuffled_top_minus_bottom,
+            noise.observed_top_minus_bottom > noise.shuffled_p95,
             "precondition: the naive comparison really does say 'greater'"
         );
 
@@ -249,6 +272,7 @@ mod tests {
         let zero = SignalMetrics {
             observed_top_minus_bottom: 0.0,
             shuffled_top_minus_bottom: 0.0,
+            shuffled_p95: 0.002,
             observation_count: 100,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
@@ -270,6 +294,7 @@ mod tests {
         let tiny = SignalMetrics {
             observed_top_minus_bottom: 0.05,
             shuffled_top_minus_bottom: 0.0,
+            shuffled_p95: 0.002,
             observation_count: 2,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
@@ -368,6 +393,7 @@ mod tests {
         let excellent_signal = SignalMetrics {
             observed_top_minus_bottom: 0.25,
             shuffled_top_minus_bottom: 0.0001,
+            shuffled_p95: 0.002,
             observation_count: 100,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
@@ -400,6 +426,7 @@ mod tests {
         let weak = SignalMetrics {
             observed_top_minus_bottom: 0.0001,
             shuffled_top_minus_bottom: 0.01,
+            shuffled_p95: 0.002,
             observation_count: 100,
             sentiment_net_return: 0.05,
             best_baseline_net_return: 0.01,
@@ -426,6 +453,7 @@ mod tests {
         let signal = SignalMetrics {
             observed_top_minus_bottom: 0.01,
             shuffled_top_minus_bottom: 0.001,
+            shuffled_p95: 0.002,
             observation_count: 200,
             sentiment_net_return: 0.02,
             best_baseline_net_return: 0.02,
@@ -447,6 +475,7 @@ mod tests {
         let signal = SignalMetrics {
             observed_top_minus_bottom: 0.05,
             shuffled_top_minus_bottom: -0.01,
+            shuffled_p95: 0.002,
             observation_count: 500,
             sentiment_net_return: 0.03,
             best_baseline_net_return: 0.09,
@@ -464,6 +493,7 @@ mod tests {
         let signal = SignalMetrics {
             observed_top_minus_bottom: 0.01,
             shuffled_top_minus_bottom: 0.001,
+            shuffled_p95: 0.002,
             observation_count: 200,
             sentiment_net_return: 0.08,
             best_baseline_net_return: 0.02,
@@ -513,6 +543,7 @@ mod tests {
                 &SignalMetrics {
                     observed_top_minus_bottom: -0.01,
                     shuffled_top_minus_bottom: 0.01,
+                    shuffled_p95: 0.002,
                     observation_count: 100,
                     sentiment_net_return: 0.05,
                     best_baseline_net_return: 0.01,

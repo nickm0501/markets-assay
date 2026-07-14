@@ -240,6 +240,7 @@ fn build_analysis_context(
         long_quantile: config.long_quantile,
         short_quantile: config.short_quantile,
         max_modal_share: config.max_modal_share,
+        seed: config.seed,
         thresholds: config.verdict_thresholds.clone(),
     })
 }
