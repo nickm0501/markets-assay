@@ -700,3 +700,9 @@ This is the best balance of:
 6. Run the first narrow API-backed source probe
 7. Expand to the free two-year hypothesis test only after the source probe
    produces usable coverage and timing reports
+
+## Stage 0 Implementation Plan
+
+The first build is the deterministic fixture pipeline. It generates synthetic articles and price bars locally, writes immutable dataset snapshots, builds reusable `news_signal_observations`, and produces analysis/backtest reports and static charts without using external data.
+
+This intentionally defers large-scale data engineering until the program can prove the research loop end-to-end.

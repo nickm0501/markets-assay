@@ -348,3 +348,45 @@ fn run_writes_summary_charts_and_decision() {
     assert!(run_dir.join("dataset_manifest.json").exists());
     assert!(run_dir.join("observation_set_manifest.json").exists());
 }
+
+#[test]
+fn full_pipeline_reuses_snapshot_for_multiple_backtests() {
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id =
+        run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    let dataset_manifest = temp
+        .path()
+        .join("data")
+        .join("datasets")
+        .join(&dataset_id)
+        .join("manifest.json");
+    let before = std::fs::metadata(&dataset_manifest)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    for cost in ["0", "5", "10"] {
+        let mut cmd = Command::cargo_bin("markets").unwrap();
+        cmd.args([
+            "backtest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+            "--observation-set-id",
+            &observation_set_id,
+            "--cost-bps",
+            cost,
+        ])
+        .assert()
+        .success();
+    }
+
+    let after = std::fs::metadata(&dataset_manifest)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(before, after);
+}

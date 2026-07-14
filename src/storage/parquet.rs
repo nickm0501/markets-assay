@@ -25,7 +25,7 @@ where
     // NewsScope, SentimentLabel) as Arrow strings, matching their snake_case
     // serde representation, instead of erroring on data-less enum variants.
     let options = TracingOptions::default().enums_without_data_as_strings(true);
-    let fields = Vec::<FieldRef>::from_samples(&rows, options)?;
+    let fields = Vec::<FieldRef>::from_samples(rows, options)?;
     let batch = serde_arrow::to_record_batch(&fields, &rows)?;
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
