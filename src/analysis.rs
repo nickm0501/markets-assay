@@ -26,6 +26,9 @@ pub struct AnalysisSummary {
     pub source_set_coverage: f64,
     pub lexicon_hit_rate: f64,
     pub degenerate: bool,
+    pub sentiment_net_return: f64,
+    pub best_baseline_net_return: f64,
+    pub best_baseline_name: String,
     pub recommendation: String,
     /// The measurement that produced the recommendation. A verdict nobody can
     /// audit is ceremony.
@@ -55,6 +58,10 @@ pub struct AnalysisContext {
     pub short_quantile: f64,
     pub max_modal_share: f64,
     pub thresholds: VerdictThresholds,
+    /// Per configuration: (sentiment net return, best baseline net return, its
+    /// name). Computed by running all five strategies through the same backtest
+    /// engine BEFORE analysis, so the verdict can apply the spec's baseline gate.
+    pub strategy_nets: BTreeMap<ConfigurationKey, (f64, f64, String)>,
 }
 
 /// `run_id` is defined as one analysis/backtest configuration and result
@@ -211,10 +218,18 @@ pub fn analyze_observations(
                 lexicon_hit_rate: context.lexicon_hit_rate,
                 degenerate,
             };
+            let (sentiment_net, best_baseline_net, best_baseline_name) = context
+                .strategy_nets
+                .get(&key)
+                .cloned()
+                .unwrap_or((0.0, f64::NEG_INFINITY, "none".to_string()));
             let signal = SignalMetrics {
                 observed_top_minus_bottom: observed,
                 shuffled_top_minus_bottom: shuffled,
                 observation_count: group.len() as u32,
+                sentiment_net_return: sentiment_net,
+                best_baseline_net_return: best_baseline_net,
+                best_baseline_name,
             };
             let decision = verdict(&quality, &signal, &context.thresholds);
 
@@ -231,6 +246,9 @@ pub fn analyze_observations(
                 source_set_coverage: quality.source_set_coverage,
                 lexicon_hit_rate: quality.lexicon_hit_rate,
                 degenerate,
+                sentiment_net_return: signal.sentiment_net_return,
+                best_baseline_net_return: signal.best_baseline_net_return,
+                best_baseline_name: signal.best_baseline_name.clone(),
                 recommendation: decision.recommendation,
                 reason: decision.reason,
             }
@@ -335,6 +353,7 @@ mod tests {
                 ("finance_plus_broad".to_string(), 1),
             ]),
             article_sources: BTreeMap::new(),
+            strategy_nets: BTreeMap::new(),
             long_quantile: 0.8,
             short_quantile: 0.2,
             max_modal_share: 1.0,

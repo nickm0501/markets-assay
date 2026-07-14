@@ -11,10 +11,121 @@ pub struct BacktestResult {
     pub trades: Vec<Trade>,
 }
 
-/// One BacktestResult per (news_window, measurement_horizon, source_set)
-/// configuration, per design.md Decision 1. Quantile thresholds and the
-/// overlap-skip trade-slot logic must stay scoped to one configuration —
-/// pooling them lets unrelated configurations compete for the same trade.
+/// The strategy under test, and the baselines it must beat to mean anything.
+///
+/// The spec's failure gate is explicit: *"V1 should stop or revise when sentiment
+/// performs no better than shuffled or non-sentiment baselines."* Stage 0 shipped
+/// with only `ShuffledSentiment` (design.md Decision 6), which meant `continue`
+/// could never be trusted — a strategy that beats one weak baseline has not
+/// beaten anything. These are the other three.
+///
+/// Every strategy runs through the SAME engine on the SAME observations with the
+/// SAME costs and slot logic. An unfair comparison is worse than no comparison,
+/// because it looks like evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// The hypothesis: trade on sentiment.
+    Sentiment,
+    /// Never trade. The floor. If sentiment cannot beat *doing nothing* after
+    /// costs, there is no edge — and costs are the reason this is not trivial.
+    AlwaysFlat,
+    /// A seeded coin. If sentiment cannot beat noise, it *is* noise.
+    Random,
+    /// Yesterday's return in place of sentiment. Catches the most likely
+    /// disappointment: "congratulations, you have rediscovered momentum".
+    PriorReturnMomentum,
+    /// Real sentiment scores, permuted across observations. Destroys the
+    /// article↔return pairing while preserving the score *distribution* — so it
+    /// isolates whether the ORDERING carries information.
+    ShuffledSentiment,
+}
+
+impl Strategy {
+    pub const ALL: [Strategy; 5] = [
+        Strategy::Sentiment,
+        Strategy::AlwaysFlat,
+        Strategy::Random,
+        Strategy::PriorReturnMomentum,
+        Strategy::ShuffledSentiment,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Strategy::Sentiment => "sentiment",
+            Strategy::AlwaysFlat => "always_flat",
+            Strategy::Random => "random",
+            Strategy::PriorReturnMomentum => "prior_return_momentum",
+            Strategy::ShuffledSentiment => "shuffled_sentiment",
+        }
+    }
+
+    pub fn is_baseline(&self) -> bool {
+        !matches!(self, Strategy::Sentiment)
+    }
+}
+
+/// SplitMix64. A tiny, deterministic PRNG so the random baseline is reproducible
+/// from `(seed, observation_id)` alone — the spec's Required Tests demand
+/// "determinism for identical snapshot, configuration, and seed", and a baseline
+/// nobody can reproduce is not a baseline.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn seed_from(seed: u64, key: &str) -> u64 {
+    let mut hash = seed ^ 0xA076_1D64_78BD_642F;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01B3);
+    }
+    hash
+}
+
+/// The signal each strategy trades on, in place of `mean_sentiment`.
+/// `None` means "never trade" (always-flat).
+fn signals_for(
+    strategy: Strategy,
+    group: &[&NewsSignalObservation],
+    seed: u64,
+) -> Option<Vec<f64>> {
+    match strategy {
+        Strategy::Sentiment => Some(group.iter().map(|row| row.mean_sentiment).collect()),
+        Strategy::AlwaysFlat => None,
+        Strategy::PriorReturnMomentum => Some(group.iter().map(|row| row.prior_return).collect()),
+        Strategy::Random => Some(
+            group
+                .iter()
+                .map(|row| {
+                    // Seeded per observation, so the draw is stable regardless of
+                    // iteration order — reproducibility must not depend on how we
+                    // happened to walk the vector.
+                    let mut state = seed_from(seed, &row.observation_id);
+                    let value = splitmix64(&mut state);
+                    (value as f64 / u64::MAX as f64) * 2.0 - 1.0
+                })
+                .collect(),
+        ),
+        Strategy::ShuffledSentiment => {
+            let mut values: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
+            // Deterministic Fisher-Yates from the seed.
+            let mut state = seed_from(seed, "shuffled");
+            for i in (1..values.len()).rev() {
+                let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+                values.swap(i, j);
+            }
+            Some(values)
+        }
+    }
+}
+
+/// One BacktestResult per (configuration × strategy), per design.md Decision 1.
+/// Quantile thresholds and the overlap-skip trade-slot logic stay scoped to one
+/// configuration — pooling them lets unrelated configurations compete for the
+/// same trade.
 pub fn run_backtests_by_configuration(
     run_id: &str,
     observations: &[NewsSignalObservation],
@@ -22,6 +133,7 @@ pub fn run_backtests_by_configuration(
     short_quantile: f64,
     cost_bps: f64,
     max_modal_share: f64,
+    seed: u64,
 ) -> Vec<BacktestResult> {
     let mut groups: BTreeMap<(i64, i64, String), Vec<&NewsSignalObservation>> = BTreeMap::new();
     for row in observations {
@@ -35,19 +147,48 @@ pub fn run_backtests_by_configuration(
             .push(row);
     }
     groups
-        .into_iter()
-        .map(|(key, group)| {
-            run_backtest_for_configuration(
-                run_id,
-                &key,
-                &group,
-                long_quantile,
-                short_quantile,
-                cost_bps,
-                max_modal_share,
-            )
+        .iter()
+        .flat_map(|(key, group)| {
+            Strategy::ALL.iter().map(move |strategy| {
+                run_backtest_for_configuration(
+                    run_id,
+                    key,
+                    group,
+                    *strategy,
+                    long_quantile,
+                    short_quantile,
+                    cost_bps,
+                    max_modal_share,
+                    seed,
+                )
+            })
         })
         .collect()
+}
+
+/// The sentiment result for each configuration, and the best baseline it must
+/// beat. This is what turns the baselines from decoration into a gate.
+pub fn strategy_comparison(
+    results: &[BacktestResult],
+) -> BTreeMap<(i64, i64, String), (f64, f64, String)> {
+    let mut by_configuration: BTreeMap<(i64, i64, String), (f64, f64, String)> = BTreeMap::new();
+    for result in results {
+        let key = (
+            result.metrics.news_window_minutes,
+            result.metrics.measurement_horizon_minutes,
+            result.metrics.source_set.clone(),
+        );
+        let entry = by_configuration
+            .entry(key)
+            .or_insert((0.0, f64::NEG_INFINITY, String::new()));
+        if result.metrics.strategy == Strategy::Sentiment.as_str() {
+            entry.0 = result.metrics.net_return_sum;
+        } else if result.metrics.net_return_sum > entry.1 {
+            entry.1 = result.metrics.net_return_sum;
+            entry.2 = result.metrics.strategy.clone();
+        }
+    }
+    by_configuration
 }
 
 /// Share of observations sitting on the single most common sentiment value.
@@ -87,29 +228,36 @@ pub fn is_degenerate(
     long_threshold <= short_threshold || modal_share(sentiments) > max_modal_share
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_backtest_for_configuration(
     run_id: &str,
     key: &(i64, i64, String),
     observations: &[&NewsSignalObservation],
+    strategy: Strategy,
     long_quantile: f64,
     short_quantile: f64,
     cost_bps: f64,
     max_modal_share: f64,
+    seed: u64,
 ) -> BacktestResult {
-    let sentiments: Vec<f64> = observations.iter().map(|row| row.mean_sentiment).collect();
-    let long_threshold = quantile(sentiments.clone(), long_quantile);
-    let short_threshold = quantile(sentiments.clone(), short_quantile);
+    // Always-flat takes no trades by definition. It is the floor: if sentiment
+    // cannot beat DOING NOTHING after costs, there is no edge. Costs are what
+    // make that a real bar rather than a trivial one.
+    let Some(signals) = signals_for(strategy, observations, seed) else {
+        return BacktestResult {
+            metrics: metrics(run_id, key, cost_bps, strategy, &[]),
+            trades: Vec::new(),
+        };
+    };
 
-    if is_degenerate(
-        &sentiments,
-        long_threshold,
-        short_threshold,
-        max_modal_share,
-    ) {
+    let long_threshold = quantile(signals.clone(), long_quantile);
+    let short_threshold = quantile(signals.clone(), short_quantile);
+
+    if is_degenerate(&signals, long_threshold, short_threshold, max_modal_share) {
         // Zero trades, flagged. NOT an all-long book, and not a silent zero
         // either — a caller must be able to tell "we declined to trade this"
         // from "we traded it and made nothing".
-        let mut metrics = metrics(run_id, key, cost_bps, &[]);
+        let mut metrics = metrics(run_id, key, cost_bps, strategy, &[]);
         metrics.degenerate = true;
         return BacktestResult {
             metrics,
@@ -117,20 +265,27 @@ fn run_backtest_for_configuration(
         };
     }
 
+    // Sort by entry, carrying each row's signal with it, so every strategy meets
+    // identical trade-slot logic. The comparison is only evidence if it is fair.
+    let mut sorted: Vec<(&NewsSignalObservation, f64)> = observations
+        .iter()
+        .copied()
+        .zip(signals.iter().copied())
+        .collect();
+    sorted.sort_by_key(|(row, _)| (row.entry_time, row.symbol.clone()));
+
     let mut last_exit_by_symbol = BTreeMap::<String, chrono::DateTime<chrono::Utc>>::new();
-    let mut sorted: Vec<&NewsSignalObservation> = observations.to_vec();
-    sorted.sort_by_key(|row| (row.entry_time, row.symbol.clone()));
     let mut trades = Vec::new();
-    for row in sorted {
+    for (row, signal) in sorted {
         if last_exit_by_symbol
             .get(&row.symbol)
             .is_some_and(|last_exit| row.entry_time < *last_exit)
         {
             continue;
         }
-        let side = if row.mean_sentiment >= long_threshold {
+        let side = if signal >= long_threshold {
             "long"
-        } else if row.mean_sentiment <= short_threshold {
+        } else if signal <= short_threshold {
             "short"
         } else {
             continue;
@@ -149,17 +304,18 @@ fn run_backtest_for_configuration(
             news_window_minutes: key.0,
             measurement_horizon_minutes: key.1,
             source_set: key.2.clone(),
+            strategy: strategy.as_str().into(),
             side: side.into(),
             signal_time: row.signal_time,
             entry_time: row.entry_time,
             exit_time: row.exit_time,
-            sentiment: row.mean_sentiment,
+            sentiment: signal,
             gross_return,
             cost_bps,
             net_return,
         });
     }
-    let metrics = metrics(run_id, key, cost_bps, &trades);
+    let metrics = metrics(run_id, key, cost_bps, strategy, &trades);
     BacktestResult { metrics, trades }
 }
 
@@ -176,6 +332,7 @@ fn metrics(
     run_id: &str,
     key: &(i64, i64, String),
     cost_bps: f64,
+    strategy: Strategy,
     trades: &[Trade],
 ) -> BacktestMetrics {
     let gross_return_sum: f64 = trades.iter().map(|trade| trade.gross_return).sum();
@@ -200,6 +357,7 @@ fn metrics(
         news_window_minutes: key.0,
         measurement_horizon_minutes: key.1,
         source_set: key.2.clone(),
+        strategy: strategy.as_str().into(),
         cost_bps,
         trade_count: trades.len() as u32,
         long_count: trades.iter().filter(|trade| trade.side == "long").count() as u32,
@@ -296,6 +454,9 @@ mod tests {
         build_observations(&config, "ds_test", &articles, &fixture.price_bars).unwrap()
     }
 
+    /// The SENTIMENT result for one configuration. Every configuration now emits
+    /// five results (sentiment + four baselines), so a test that just takes the
+    /// first match would silently assert against a baseline.
     fn finance_only_hour_hour_result(results: &[BacktestResult]) -> &BacktestResult {
         results
             .iter()
@@ -303,6 +464,7 @@ mod tests {
                 result.metrics.news_window_minutes == 60
                     && result.metrics.measurement_horizon_minutes == 60
                     && result.metrics.source_set == "finance_only"
+                    && result.metrics.strategy == Strategy::Sentiment.as_str()
             })
             .unwrap()
     }
@@ -371,18 +533,21 @@ mod tests {
             .collect();
         group.push(observation_with_sentiment(0.5, 0.02));
 
-        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8);
+        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let sentiment = results
+            .iter()
+            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .unwrap();
 
-        assert_eq!(results.len(), 1);
         assert!(
-            results[0].metrics.degenerate,
+            sentiment.metrics.degenerate,
             "a distribution that is 90% ties must be flagged, not traded"
         );
         assert_eq!(
-            results[0].metrics.trade_count, 0,
+            sentiment.metrics.trade_count, 0,
             "expected zero trades, got an all-long book"
         );
-        assert!(results[0].trades.is_empty());
+        assert!(sentiment.trades.is_empty());
     }
 
     #[test]
@@ -435,12 +600,16 @@ mod tests {
             .map(|i| observation_with_sentiment(i as f64 / 10.0, 0.01 * i as f64))
             .collect();
 
-        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8);
+        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let sentiment = results
+            .iter()
+            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .unwrap();
 
-        assert!(!results[0].metrics.degenerate);
-        assert!(results[0].metrics.trade_count > 0);
-        assert!(results[0].metrics.long_count > 0);
-        assert!(results[0].metrics.short_count > 0);
+        assert!(!sentiment.metrics.degenerate);
+        assert!(sentiment.metrics.trade_count > 0);
+        assert!(sentiment.metrics.long_count > 0);
+        assert!(sentiment.metrics.short_count > 0);
     }
 
     #[test]
@@ -450,9 +619,156 @@ mod tests {
     }
 
     #[test]
-    fn backtest_takes_long_and_short_trades_within_a_configuration() {
+    fn always_flat_takes_zero_trades_and_returns_zero() {
+        // The floor, and NOT a trivial one: always-flat pays no costs. A strategy
+        // that trades 200 times to earn less than doing nothing has discovered a
+        // way to pay commissions.
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
+            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let flat: Vec<&BacktestResult> = results
+            .iter()
+            .filter(|r| r.metrics.strategy == Strategy::AlwaysFlat.as_str())
+            .collect();
+
+        assert!(!flat.is_empty());
+        for result in flat {
+            assert_eq!(result.metrics.trade_count, 0);
+            assert!(result.trades.is_empty());
+            assert_eq!(result.metrics.gross_return_sum, 0.0);
+        }
+    }
+
+    #[test]
+    fn the_random_baseline_is_reproducible_from_its_seed() {
+        // The spec's Required Tests demand "determinism for identical snapshot,
+        // configuration, and seed". A baseline nobody can reproduce is not a
+        // baseline, it is an anecdote.
+        let first = run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 7);
+        let second = run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 7);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_different_seed_gives_a_different_random_baseline() {
+        // Otherwise the seed is decorative and the "random" baseline is a fixed
+        // pattern wearing a costume.
+        let net = |seed: u64| -> f64 {
+            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, seed)
+                .iter()
+                .filter(|r| r.metrics.strategy == Strategy::Random.as_str())
+                .map(|r| r.metrics.net_return_sum)
+                .sum()
+        };
+
+        assert_ne!(net(7), net(9999));
+    }
+
+    #[test]
+    fn the_momentum_baseline_trades_on_prior_return_not_on_sentiment() {
+        // The "congratulations, you have rediscovered momentum" check. On the
+        // real sample this baseline BEATS sentiment in 4 of 6 configurations.
+        let group: Vec<NewsSignalObservation> = (0..10)
+            .map(|i| {
+                let mut row = observation_with_sentiment(0.5, 0.01);
+                row.observation_id = format!("obs-{i}");
+                // Sentiment is IDENTICAL everywhere; only prior_return varies. A
+                // momentum strategy must still be able to rank and trade.
+                row.prior_return = i as f64 / 10.0;
+                row.future_return = 0.01 * i as f64;
+                row
+            })
+            .collect();
+
+        let results = run_backtests_by_configuration("run", &group, 0.8, 0.2, 0.0, 0.8, 42);
+        let momentum = results
+            .iter()
+            .find(|r| r.metrics.strategy == Strategy::PriorReturnMomentum.as_str())
+            .unwrap();
+        let sentiment = results
+            .iter()
+            .find(|r| r.metrics.strategy == Strategy::Sentiment.as_str())
+            .unwrap();
+
+        // Sentiment is all ties -> degenerate -> no trades. Momentum has a real
+        // spread of prior returns -> it trades. This proves they read DIFFERENT
+        // fields.
+        assert!(sentiment.metrics.degenerate);
+        assert_eq!(sentiment.metrics.trade_count, 0);
+        assert!(!momentum.metrics.degenerate);
+        assert!(momentum.metrics.trade_count > 0);
+    }
+
+    #[test]
+    fn all_five_strategies_are_backtested_on_identical_observations() {
+        // An unfair comparison is worse than no comparison, because it looks like
+        // evidence. Every strategy must meet the same observations, the same
+        // costs, and the same trade-slot logic — only the SIGNAL differs.
+        let results =
+            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let configurations = crate::analysis::configuration_groups(&observations()).len();
+
+        assert_eq!(results.len(), configurations * Strategy::ALL.len());
+        for result in &results {
+            assert_eq!(result.metrics.cost_bps, 5.0);
+        }
+        // Every configuration has exactly one row per strategy.
+        for strategy in Strategy::ALL {
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|r| r.metrics.strategy == strategy.as_str())
+                    .count(),
+                configurations,
+                "{} is missing from some configuration",
+                strategy.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn strategy_comparison_reports_sentiment_against_its_strongest_baseline() {
+        // Not against the weakest, and not against the average. If ANY baseline
+        // matches sentiment, sentiment has not found anything.
+        let results =
+            run_backtests_by_configuration("run", &observations(), 0.8, 0.2, 5.0, 0.8, 42);
+        let comparison = strategy_comparison(&results);
+
+        assert!(!comparison.is_empty());
+        for (key, (sentiment_net, best_baseline_net, best_name)) in &comparison {
+            let actual_best = results
+                .iter()
+                .filter(|r| {
+                    (
+                        r.metrics.news_window_minutes,
+                        r.metrics.measurement_horizon_minutes,
+                        r.metrics.source_set.clone(),
+                    ) == *key
+                        && r.metrics.strategy != Strategy::Sentiment.as_str()
+                })
+                .map(|r| r.metrics.net_return_sum)
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            assert!(
+                (best_baseline_net - actual_best).abs() < 1e-12,
+                "must be the MAX baseline"
+            );
+            assert!(!best_name.is_empty());
+            assert!(sentiment_net.is_finite());
+        }
+    }
+
+    #[test]
+    fn backtest_takes_long_and_short_trades_within_a_configuration() {
+        let results = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            5.0,
+            0.8,
+            42,
+        );
         let result = finance_only_hour_hour_result(&results);
 
         assert!(result.metrics.long_count > 0);
@@ -462,8 +778,15 @@ mod tests {
 
     #[test]
     fn backtest_does_not_mix_trade_slots_across_configurations() {
-        let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
+        let results = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            5.0,
+            0.8,
+            42,
+        );
 
         assert!(results.len() > 1);
         assert!(
@@ -480,10 +803,24 @@ mod tests {
 
     #[test]
     fn costs_reduce_net_returns() {
-        let no_cost =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0, 0.8);
-        let with_cost =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 10.0, 0.8);
+        let no_cost = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            0.0,
+            0.8,
+            42,
+        );
+        let with_cost = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            10.0,
+            0.8,
+            42,
+        );
         let no_cost_total: f64 = no_cost
             .iter()
             .map(|result| result.metrics.net_return_sum)
@@ -498,8 +835,15 @@ mod tests {
 
     #[test]
     fn short_trade_profit_uses_negative_future_return() {
-        let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 0.0, 0.8);
+        let results = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            0.0,
+            0.8,
+            42,
+        );
         let profitable_short = results
             .iter()
             .flat_map(|result| result.trades.iter())
@@ -514,8 +858,15 @@ mod tests {
         // Spec's Backtest Rules: "Report long and short sides separately as
         // well as combined." The combined fields must always equal the sum
         // of the long-only and short-only fields for the same trade set.
-        let results =
-            run_backtests_by_configuration("stage0_fixture", &observations(), 0.8, 0.2, 5.0, 0.8);
+        let results = run_backtests_by_configuration(
+            "stage0_fixture",
+            &observations(),
+            0.8,
+            0.2,
+            5.0,
+            0.8,
+            42,
+        );
         let result = finance_only_hour_hour_result(&results);
         let metrics = &result.metrics;
 
@@ -579,7 +930,7 @@ mod tests {
         assert_eq!(observation.article_ids, vec![normalized.article_id.clone()]);
 
         let results =
-            run_backtests_by_configuration("stage0_fixture", &observations, 0.8, 0.2, 5.0, 0.8);
+            run_backtests_by_configuration("stage0_fixture", &observations, 0.8, 0.2, 5.0, 0.8, 42);
         let trade = results
             .iter()
             .flat_map(|result| result.trades.iter())

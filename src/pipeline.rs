@@ -1,7 +1,7 @@
 use crate::{
     analysis::{AnalysisContext, analyze_observations, bucket_return_rows, coverage_rows},
     audit::{assert_no_lookahead, timestamp_audit_rows},
-    backtest::run_backtests_by_configuration,
+    backtest::{run_backtests_by_configuration, strategy_comparison},
     config::PipelineConfig,
     domain::{
         article::{Disposition, NormalizedArticle, SetAsideArticle},
@@ -161,7 +161,25 @@ fn build_analysis_context(
     config: &PipelineConfig,
     root: &Path,
     dataset_id: &str,
+    observations: &[NewsSignalObservation],
 ) -> Result<AnalysisContext> {
+    // Run every strategy — sentiment and its four baselines — through the same
+    // engine BEFORE analysis, so the verdict can apply the spec's baseline gate:
+    // "stop or revise when sentiment performs no better than shuffled or
+    // non-sentiment baselines". Without this, `continue` means only "beat one
+    // weak baseline", which is not a finding.
+    let cost_bps = config.costs_bps.first().copied().unwrap_or(0.0);
+    let all_strategies = run_backtests_by_configuration(
+        &config.run_id,
+        observations,
+        config.long_quantile,
+        config.short_quantile,
+        cost_bps,
+        config.max_modal_share,
+        config.seed,
+    );
+    let strategy_nets = strategy_comparison(&all_strategies);
+
     let dataset_dir = root.join("data").join("datasets").join(dataset_id);
     let manifest: DatasetManifest =
         serde_json::from_slice(&fs::read(dataset_dir.join("manifest.json"))?)?;
@@ -218,6 +236,7 @@ fn build_analysis_context(
         lexicon_hit_rate,
         expected_sources,
         article_sources,
+        strategy_nets,
         long_quantile: config.long_quantile,
         short_quantile: config.short_quantile,
         max_modal_share: config.max_modal_share,
@@ -386,7 +405,12 @@ pub fn run_analyze(
         read_parquet(&observation_dir.join("news_signal_observations.parquet"))?;
     let observation_manifest: ObservationSetManifest =
         serde_json::from_slice(&fs::read(observation_dir.join("manifest.json"))?)?;
-    let context = build_analysis_context(config, &root, &observation_manifest.input.dataset_id)?;
+    let context = build_analysis_context(
+        config,
+        &root,
+        &observation_manifest.input.dataset_id,
+        &observations,
+    )?;
     let summaries = analyze_observations(&observations, &context);
     let continue_count = summaries
         .iter()
@@ -522,6 +546,7 @@ pub fn run_backtest_command(
         config.short_quantile,
         cost_bps,
         config.max_modal_share,
+        config.seed,
     );
     let total_trades: usize = results.iter().map(|result| result.trades.len()).sum();
     if dry_run {
@@ -599,7 +624,7 @@ pub fn run_all(
             .join(&observation_set_id)
             .join("news_signal_observations.parquet"),
     )?;
-    let context = build_analysis_context(config, &root, &dataset_id)?;
+    let context = build_analysis_context(config, &root, &dataset_id, &observations)?;
     let analyses = analyze_observations(&observations, &context);
     let cost_bps = config.costs_bps.first().copied().unwrap_or(0.0);
     let backtests = run_backtests_by_configuration(
@@ -609,6 +634,7 @@ pub fn run_all(
         config.short_quantile,
         cost_bps,
         config.max_modal_share,
+        config.seed,
     );
     let metrics: Vec<_> = backtests
         .iter()

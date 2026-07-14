@@ -22,13 +22,19 @@ pub struct DataQualityMetrics {
 
 /// Whether sentiment appears to predict returns. Only meaningful once the data
 /// is known to be usable.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignalMetrics {
     pub observed_top_minus_bottom: f64,
     pub shuffled_top_minus_bottom: f64,
     /// How many observations the spread was computed from. A spread from two
     /// rows is not a weak result — it is not a result.
     pub observation_count: u32,
+    /// Net return of the sentiment strategy, and of the BEST of its baselines.
+    /// The spec's failure gate: "stop or revise when sentiment performs no better
+    /// than shuffled or non-sentiment baselines."
+    pub sentiment_net_return: f64,
+    pub best_baseline_net_return: f64,
+    pub best_baseline_name: String,
 }
 
 /// A verdict, plus the specific measurement that produced it.
@@ -128,13 +134,13 @@ pub fn verdict(
     // the strength of a 1e-18 difference. An edge you can only see past the 15th
     // decimal place is not an edge, it is rounding.
     let margin = signal.observed_top_minus_bottom - signal.shuffled_top_minus_bottom;
-    if margin > thresholds.min_spread_margin
-        && signal.observed_top_minus_bottom > thresholds.min_spread_margin
+    if margin <= thresholds.min_spread_margin
+        || signal.observed_top_minus_bottom <= thresholds.min_spread_margin
     {
         return decide(
-            "continue",
+            "revise",
             format!(
-                "observed spread {:.8} beats the shuffled baseline {:.8} by {:.8} (> min margin {:.8}) and is positive",
+                "observed spread {:.8} does not beat the shuffled baseline {:.8} by a meaningful margin (got {:.8}, need > {:.8})",
                 signal.observed_top_minus_bottom,
                 signal.shuffled_top_minus_bottom,
                 margin,
@@ -142,14 +148,42 @@ pub fn verdict(
             ),
         );
     }
+
+    // THE BASELINE GATE. The spec: "V1 should stop or revise when sentiment
+    // performs no better than shuffled or non-sentiment baselines."
+    //
+    // A positive spread that ANY baseline matches is not a finding. `always_flat`
+    // in particular is a real bar and not a trivial one, because it pays no costs:
+    // a strategy that trades 200 times to earn less than doing nothing has
+    // discovered a way to pay commissions. And `prior_return_momentum` catches
+    // the likeliest disappointment of all — "congratulations, you have
+    // rediscovered momentum".
+    //
+    // Stage 0 shipped with only the shuffled baseline (Decision 6), which meant
+    // `continue` could never be trusted. This is the gate that makes it mean
+    // something.
+    if signal.sentiment_net_return <= signal.best_baseline_net_return {
+        return decide(
+            "revise",
+            format!(
+                "sentiment net return {:.6} does not beat its best baseline ({} at {:.6}) — a spread that a baseline matches is not a finding",
+                signal.sentiment_net_return,
+                signal.best_baseline_name,
+                signal.best_baseline_net_return
+            ),
+        );
+    }
+
     decide(
-        "revise",
+        "continue",
         format!(
-            "observed spread {:.8} does not beat the shuffled baseline {:.8} by a meaningful margin (got {:.8}, need > {:.8})",
+            "observed spread {:.8} beats the shuffled baseline {:.8} by {:.8}, AND sentiment net {:.6} beats its best baseline ({} at {:.6})",
             signal.observed_top_minus_bottom,
             signal.shuffled_top_minus_bottom,
             margin,
-            thresholds.min_spread_margin
+            signal.sentiment_net_return,
+            signal.best_baseline_name,
+            signal.best_baseline_net_return
         ),
     )
 }
@@ -173,6 +207,9 @@ mod tests {
             observed_top_minus_bottom: 0.01,
             shuffled_top_minus_bottom: 0.001,
             observation_count: 100,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         }
     }
 
@@ -189,6 +226,9 @@ mod tests {
             observed_top_minus_bottom: 0.0032000000000000004,
             shuffled_top_minus_bottom: 0.0032,
             observation_count: 100,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         };
         assert!(
             noise.observed_top_minus_bottom > noise.shuffled_top_minus_bottom,
@@ -210,6 +250,9 @@ mod tests {
             observed_top_minus_bottom: 0.0,
             shuffled_top_minus_bottom: 0.0,
             observation_count: 100,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         };
 
         assert_eq!(
@@ -228,6 +271,9 @@ mod tests {
             observed_top_minus_bottom: 0.05,
             shuffled_top_minus_bottom: 0.0,
             observation_count: 2,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         };
 
         let verdict = verdict(&healthy_quality(), &tiny, &VerdictThresholds::default());
@@ -323,6 +369,9 @@ mod tests {
             observed_top_minus_bottom: 0.25,
             shuffled_top_minus_bottom: 0.0001,
             observation_count: 100,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         };
 
         let verdict = verdict(
@@ -352,11 +401,79 @@ mod tests {
             observed_top_minus_bottom: 0.0001,
             shuffled_top_minus_bottom: 0.01,
             observation_count: 100,
+            sentiment_net_return: 0.05,
+            best_baseline_net_return: 0.01,
+            best_baseline_name: "prior_return_momentum".to_string(),
         };
 
         let verdict = verdict(&healthy_quality(), &weak, &VerdictThresholds::default());
 
         assert_eq!(verdict.recommendation, "revise");
+    }
+
+    #[test]
+    fn sentiment_that_merely_matches_its_best_baseline_yields_revise() {
+        // THE TEST THAT STOPS US FOOLING OURSELVES.
+        //
+        // The spread is positive and beats the shuffled baseline — everything the
+        // old gate asked for. But a NON-sentiment baseline earns just as much. A
+        // finding that a coin flip, or yesterday's return, matches is not a
+        // finding.
+        //
+        // This is not hypothetical. On the real sample, `prior_return_momentum`
+        // beats sentiment in 4 of 6 configurations, and the run reported a
+        // `continue` until this gate existed.
+        let signal = SignalMetrics {
+            observed_top_minus_bottom: 0.01,
+            shuffled_top_minus_bottom: 0.001,
+            observation_count: 200,
+            sentiment_net_return: 0.02,
+            best_baseline_net_return: 0.02,
+            best_baseline_name: "prior_return_momentum".to_string(),
+        };
+
+        let verdict = verdict(&healthy_quality(), &signal, &VerdictThresholds::default());
+
+        assert_eq!(verdict.recommendation, "revise");
+        assert!(verdict.reason.contains("does not beat its best baseline"));
+        assert!(verdict.reason.contains("prior_return_momentum"));
+    }
+
+    #[test]
+    fn sentiment_losing_to_momentum_yields_revise_even_with_a_great_spread() {
+        // "Congratulations, you have rediscovered momentum." The most likely
+        // disappointment in this entire project, and the one a spread-only gate
+        // is blind to.
+        let signal = SignalMetrics {
+            observed_top_minus_bottom: 0.05,
+            shuffled_top_minus_bottom: -0.01,
+            observation_count: 500,
+            sentiment_net_return: 0.03,
+            best_baseline_net_return: 0.09,
+            best_baseline_name: "prior_return_momentum".to_string(),
+        };
+
+        assert_eq!(
+            verdict(&healthy_quality(), &signal, &VerdictThresholds::default()).recommendation,
+            "revise"
+        );
+    }
+
+    #[test]
+    fn continue_requires_beating_both_the_spread_test_and_every_baseline() {
+        let signal = SignalMetrics {
+            observed_top_minus_bottom: 0.01,
+            shuffled_top_minus_bottom: 0.001,
+            observation_count: 200,
+            sentiment_net_return: 0.08,
+            best_baseline_net_return: 0.02,
+            best_baseline_name: "prior_return_momentum".to_string(),
+        };
+
+        let verdict = verdict(&healthy_quality(), &signal, &VerdictThresholds::default());
+
+        assert_eq!(verdict.recommendation, "continue");
+        assert!(verdict.reason.contains("beats its best baseline"));
     }
 
     #[test]
@@ -397,6 +514,9 @@ mod tests {
                     observed_top_minus_bottom: -0.01,
                     shuffled_top_minus_bottom: 0.01,
                     observation_count: 100,
+                    sentiment_net_return: 0.05,
+                    best_baseline_net_return: 0.01,
+                    best_baseline_name: "prior_return_momentum".to_string(),
                 },
                 &thresholds,
             ),

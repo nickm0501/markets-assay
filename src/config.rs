@@ -25,6 +25,10 @@ fn default_max_modal_share() -> f64 {
     0.8
 }
 
+fn default_seed() -> u64 {
+    42
+}
+
 /// Thresholds for the spec's 5-value decision vocabulary.
 ///
 /// Every one lives in config rather than in the verdict function. Stage 3 will
@@ -117,6 +121,13 @@ pub struct PipelineConfig {
     pub max_modal_share: f64,
     #[serde(default)]
     pub verdict_thresholds: VerdictThresholds,
+    /// Seed for the random baseline and the shuffled permutation.
+    ///
+    /// The spec's Required Tests demand "determinism for identical snapshot,
+    /// configuration, and seed". A baseline nobody can reproduce is not a
+    /// baseline — it is an anecdote.
+    #[serde(default = "default_seed")]
+    pub seed: u64,
     pub costs_bps: Vec<f64>,
     pub holidays: Vec<NaiveDate>,
     pub early_closes: BTreeMap<NaiveDate, String>,

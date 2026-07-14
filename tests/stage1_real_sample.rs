@@ -127,12 +127,18 @@ fn trace_one_real_article_from_vendor_json_through_to_its_trade() {
         config.short_quantile,
         10.0,
         config.max_modal_share,
+        config.seed,
     );
+    // Every configuration now emits five results (sentiment + four baselines),
+    // so the trade must be pinned to the SENTIMENT strategy — otherwise this
+    // could silently assert against a random coin flip.
     let trade = results
         .iter()
         .flat_map(|result| result.trades.iter())
-        .find(|trade| trade.observation_id == observation.observation_id)
-        .expect("a +0.5 sentiment observation must clear the long threshold");
+        .find(|trade| {
+            trade.observation_id == observation.observation_id && trade.strategy == "sentiment"
+        })
+        .expect("a strongly positive observation must clear the long threshold");
 
     assert_eq!(trade.symbol, "AVGO");
     assert_eq!(trade.side, "long");

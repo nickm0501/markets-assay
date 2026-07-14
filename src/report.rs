@@ -53,8 +53,8 @@ pub fn write_summary(
          Each row is one (news_window, measurement_horizon, source_set) configuration.\n\
          Configurations are never blended into a single verdict (design.md Decision 1).\n\
          Long and short sides are reported separately as well as combined (spec Backtest Rules).\n\n\
-         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | reason | degenerate | articles_per_signal | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | reason | sentiment_net | best_baseline | best_baseline_net | degenerate | articles_per_signal | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         analyses.len(),
     );
     for analysis in analyses {
@@ -89,13 +89,16 @@ pub fn write_summary(
             })
             .unwrap_or((0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0));
         text.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.6} | {} | {:.6} | {} | {:.2} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
             analysis.news_window_minutes,
             analysis.measurement_horizon_minutes,
             analysis.source_set,
             analysis.observation_count,
             analysis.recommendation,
             analysis.reason,
+            analysis.sentiment_net_return,
+            analysis.best_baseline_name,
+            analysis.best_baseline_net_return,
             analysis.degenerate,
             analysis.articles_per_signal,
             analysis.observed_top_minus_bottom,
@@ -185,6 +188,9 @@ mod tests {
                 source_set_coverage: 1.0,
                 lexicon_hit_rate: 0.9,
                 degenerate: false,
+                sentiment_net_return: 0.03,
+                best_baseline_net_return: 0.01,
+                best_baseline_name: "prior_return_momentum".into(),
                 recommendation: "continue".into(),
                 reason: "observed spread beats the shuffled baseline".into(),
             },
@@ -201,6 +207,9 @@ mod tests {
                 source_set_coverage: 1.0,
                 lexicon_hit_rate: 0.9,
                 degenerate: false,
+                sentiment_net_return: 0.005,
+                best_baseline_net_return: 0.02,
+                best_baseline_name: "prior_return_momentum".into(),
                 recommendation: "revise".into(),
                 reason: "observed spread does not beat the shuffled baseline".into(),
             },
@@ -211,6 +220,7 @@ mod tests {
                 news_window_minutes: 60,
                 measurement_horizon_minutes: 60,
                 source_set: "finance_only".into(),
+                strategy: "sentiment".into(),
                 cost_bps: 5.0,
                 trade_count: 4,
                 long_count: 2,
@@ -236,6 +246,7 @@ mod tests {
                 news_window_minutes: 240,
                 measurement_horizon_minutes: 60,
                 source_set: "broad_news".into(),
+                strategy: "sentiment".into(),
                 cost_bps: 5.0,
                 trade_count: 3,
                 long_count: 1,

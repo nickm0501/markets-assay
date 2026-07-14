@@ -30,6 +30,10 @@ pub struct Trade {
     pub news_window_minutes: i64,
     pub measurement_horizon_minutes: i64,
     pub source_set: String,
+    /// Which strategy took this trade: `sentiment` or one of the baselines.
+    /// Every strategy runs through the same engine on the same observations, so
+    /// their trade logs are directly comparable.
+    pub strategy: String,
     pub side: String,
     pub signal_time: DateTime<Utc>,
     pub entry_time: DateTime<Utc>,
@@ -51,6 +55,11 @@ pub struct BacktestMetrics {
     pub news_window_minutes: i64,
     pub measurement_horizon_minutes: i64,
     pub source_set: String,
+    /// `sentiment` | `always_flat` | `random` | `prior_return_momentum` |
+    /// `shuffled_sentiment`. The spec's failure gate turns on comparing these:
+    /// "stop or revise when sentiment performs no better than shuffled or
+    /// non-sentiment baselines".
+    pub strategy: String,
     pub cost_bps: f64,
     pub trade_count: u32,
     pub long_count: u32,

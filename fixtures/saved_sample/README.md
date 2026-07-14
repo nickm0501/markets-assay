@@ -123,6 +123,38 @@ quarantine path is correct but was not exercised by this sample.
 
 ---
 
+## STAGE 2 RESULT: sentiment loses to momentum
+
+With the new scorer (LM+VADER, `lexicon_hit_rate` 0.20 → **0.82**) and all four
+baselines in place, the real sample says:
+
+| configuration | sentiment | always_flat | random | **momentum** | shuffled | winner |
+|---|---|---|---|---|---|---|
+| broad_news w=240 | -0.041 | -0.000 | -0.022 | **+0.023** | +0.005 | momentum |
+| finance_only w=240 | +0.023 | -0.000 | +0.044 | **+0.070** | -0.018 | momentum |
+| finance_plus_broad w=240 | +0.034 | -0.000 | -0.020 | +0.066 | **+0.113** | shuffled |
+| broad_news w=60 | -0.018 | -0.000 | +0.004 | **+0.016** | -0.007 | momentum |
+| finance_only w=60 | +0.032 | -0.000 | +0.005 | +0.079 | **+0.098** | shuffled |
+| finance_plus_broad w=60 | +0.024 | -0.000 | -0.086 | **+0.098** | -0.009 | momentum |
+
+**Sentiment wins 0 of 6.** `prior_return_momentum` beats it in **4 of 6**;
+sentiment's own scores, *randomly shuffled*, beat it in the other 2.
+
+**All 6 configurations: `revise`.**
+
+Before the baselines existed, this sample reported a **`continue`** — a +0.045%
+spread that beat only the shuffled baseline. It was a false positive, and the
+baselines caught it. That is precisely what Decision 6's gate was for, and why
+`continue` meant nothing until it existed.
+
+Two caveats, in both directions:
+
+- **This does not prove sentiment is worthless.** Five days, one bull week, 381
+  articles. It proves nothing either way — that is what Stage 3's two years are
+  for.
+- **It does prove the gates work.** A pipeline that reports `continue` on noise
+  is worse than useless, because someone will believe it. This one now doesn't.
+
 ## The hand-trace (spec: Required Tests)
 
 One real article, followed from the vendor's raw JSON to the trade it caused.

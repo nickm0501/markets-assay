@@ -69,12 +69,19 @@ fn run_accepts_checked_in_stage0_config() {
 /// |                     | Loughran-McDonald + VADER, so every sentiment score |
 /// |                     | changed and SENTIMENT_VERSION bumped.              |
 ///
-/// THE VERDICTS ALSO MOVED, and that one is not cosmetic. Stage 0 through Stage 1
-/// reported "5 continue, 1 revise". **Two of those five were floating-point
-/// noise**: `observed > shuffled` was TRUE for spreads equal to fifteen decimal
-/// places, because they were summed in a different order. The verdict now demands
-/// a `min_spread_margin`, and the honest fixture result is **3 continue, 3
-/// revise**. The number this project quoted for a week was wrong.
+/// THE VERDICTS ALSO MOVED, twice, and neither is cosmetic.
+///
+/// 1. Stage 0 through Stage 1 reported "5 continue, 1 revise". **Two of those
+///    five were floating-point noise**: `observed > shuffled` was TRUE for
+///    spreads equal to fifteen decimal places, because they were summed in a
+///    different order. With `min_spread_margin`, the honest figure was 3 and 3.
+/// 2. Then the four baselines landed (Decision 6's open half). `continue` now
+///    also requires beating EVERY baseline, not just the shuffled one. On the
+///    fixture — synthetic data with a DELIBERATELY PLANTED signal — sentiment
+///    beats all four baselines in only **1 of 6** configurations.
+///
+/// So the fixture stands at **1 continue, 5 revise**. Each tightening made the
+/// number smaller, and each one was a bug or a missing gate, not a regression.
 const FIXTURE_DATASET_ID: &str = "ds_64a221a5a8ec40a7";
 const FIXTURE_OBSERVATION_SET_ID: &str = "obs_d410aabf8be6f939";
 
@@ -105,8 +112,8 @@ fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
     // One line per verdict value that actually occurred. `run_all` used to
     // print "revise" as `total - continue`, which folded stop/expand data/
     // expand sources into `revise` the moment the full vocabulary existed.
-    .stdout(predicate::str::contains("decisions_continue=3"))
-    .stdout(predicate::str::contains("decisions_revise=3"));
+    .stdout(predicate::str::contains("decisions_continue=1"))
+    .stdout(predicate::str::contains("decisions_revise=5"));
 }
 
 /// Task 9: the leakage check and inspection tables run on every invocation, not
