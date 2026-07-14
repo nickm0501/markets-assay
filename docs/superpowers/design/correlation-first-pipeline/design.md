@@ -12,6 +12,43 @@ here.
 
 ### Known
 
+- **Stage 2 found SEVEN bugs, and three of them invalidate results this project
+  had already reported. The pattern is worth internalising: every one was found
+  by asking "how would I know if this were wrong?" rather than by reading the
+  code again.**
+  1. **The verdict was decided by floating-point noise.** `observed > shuffled`
+     compared spreads equal to fifteen decimal places, differing only in the
+     order the floats were summed. **Two of Stage 0's five `continue` verdicts
+     were rounding error** — a figure quoted in every doc since 2026-07-13.
+  2. **The "shuffled" null was a ROTATION BY ONE**, not a shuffle. It paired each
+     return with its *neighbour's* sentiment, and neighbours have similar
+     sentiment — so **the null converged on the real hypothesis as the sample
+     grew**, and a genuine signal was rejected more readily the more evidence you
+     gave it. **Every `observed vs shuffled` number this project reported before
+     2026-07-14 was meaningless.**
+  3. **The significance bar was the null's MEAN** — a coin flip, since ~50% of
+     pure-noise draws beat the mean of their own null. The pipeline reported
+     `continue` on data with zero planted signal. The bar is now the **95th
+     percentile** (p < 0.05).
+  4. **Quantile thresholds were fitted on the future.** `quantile(signals, 0.8)`
+     ran over the ENTIRE dataset, so a trade on day 1 used a threshold derived
+     from day 7's sentiment. **`assert_no_lookahead` could never catch it** — the
+     leak was not in the articles (which were clean) but in the THRESHOLD. We had
+     built a lookahead detector blind to a lookahead bug.
+  5. `backtest` was the one command that emitted a trade log **without** running
+     the leakage check.
+  6. **A 2-observation configuration reported `continue`** by "beating" a baseline
+     that `shuffled_spread` had returned `0.0` for *by fiat*, not computed.
+  7. Alpaca rejects `60Min` (HTTP 400, max 59). **One hour must be `1Hour`** —
+     and one hour is the spec's PRIMARY interval. Only sending the request found
+     it.
+- **The detector is now verified in BOTH directions** (`tests/power_check.rs`).
+  Before Stage 2, every result was `revise` — and **a pipeline hardcoded to
+  `revise` would have passed every test we had.** We had proven it does not cry
+  wolf; we had never proven it can bark. It now rejects pure noise at every
+  sample size AND detects planted signal, with sensitivity that *improves* with
+  more data (the broken null made it get *worse*).
+
 - The objective, free data sources, architecture, data flow, and V1 fixed
   decisions in `docs/superpowers/specs/2026-07-08-correlation-first-pipeline-design.md`
   are approved and internally coherent.
