@@ -26,6 +26,9 @@ pub struct DataQualityMetrics {
 pub struct SignalMetrics {
     pub observed_top_minus_bottom: f64,
     pub shuffled_top_minus_bottom: f64,
+    /// How many observations the spread was computed from. A spread from two
+    /// rows is not a weak result — it is not a result.
+    pub observation_count: u32,
 }
 
 /// A verdict, plus the specific measurement that produced it.
@@ -100,23 +103,53 @@ pub fn verdict(
         );
     }
 
+    // A configuration with too few observations cannot be judged at all.
+    //
+    // This is not pedantry. `shuffled_spread` returns 0.0 BY FIAT for any group
+    // smaller than 3 — it does not compute a baseline, it invents one. Comparing
+    // a real spread against a fabricated zero and declaring victory is how a
+    // 2-observation configuration ended up reporting `continue`.
+    if signal.observation_count < thresholds.min_observations {
+        return decide(
+            "expand data",
+            format!(
+                "only {} observations, below the minimum {} needed to judge a configuration at all",
+                signal.observation_count, thresholds.min_observations
+            ),
+        );
+    }
+
     // Only now is a signal result meaningful.
-    if signal.observed_top_minus_bottom > signal.shuffled_top_minus_bottom
-        && signal.observed_top_minus_bottom > 0.0
+    //
+    // The margin is NOT decoration. Comparing `observed > shuffled` directly let
+    // the verdict be decided by floating-point noise: two spreads that are equal
+    // to fifteen decimal places still compare as `>` because they were summed in
+    // a different order, and three fixture configurations reported `continue` on
+    // the strength of a 1e-18 difference. An edge you can only see past the 15th
+    // decimal place is not an edge, it is rounding.
+    let margin = signal.observed_top_minus_bottom - signal.shuffled_top_minus_bottom;
+    if margin > thresholds.min_spread_margin
+        && signal.observed_top_minus_bottom > thresholds.min_spread_margin
     {
         return decide(
             "continue",
             format!(
-                "observed spread {:.8} beats the shuffled baseline {:.8} and is positive",
-                signal.observed_top_minus_bottom, signal.shuffled_top_minus_bottom
+                "observed spread {:.8} beats the shuffled baseline {:.8} by {:.8} (> min margin {:.8}) and is positive",
+                signal.observed_top_minus_bottom,
+                signal.shuffled_top_minus_bottom,
+                margin,
+                thresholds.min_spread_margin
             ),
         );
     }
     decide(
         "revise",
         format!(
-            "observed spread {:.8} does not beat the shuffled baseline {:.8}",
-            signal.observed_top_minus_bottom, signal.shuffled_top_minus_bottom
+            "observed spread {:.8} does not beat the shuffled baseline {:.8} by a meaningful margin (got {:.8}, need > {:.8})",
+            signal.observed_top_minus_bottom,
+            signal.shuffled_top_minus_bottom,
+            margin,
+            thresholds.min_spread_margin
         ),
     )
 }
@@ -139,7 +172,72 @@ mod tests {
         SignalMetrics {
             observed_top_minus_bottom: 0.01,
             shuffled_top_minus_bottom: 0.001,
+            observation_count: 100,
         }
+    }
+
+    #[test]
+    fn a_spread_that_beats_the_baseline_only_by_floating_point_noise_is_not_a_continue() {
+        // THE FALSE-POSITIVE GENERATOR, pinned.
+        //
+        // Found on the fixture 2026-07-14: three configurations reported
+        // `continue` because `observed > shuffled` was TRUE for two numbers that
+        // are equal to fifteen decimal places — they differed only by the order
+        // the floats were summed in. An edge visible only past the 15th decimal
+        // place is rounding, not signal.
+        let noise = SignalMetrics {
+            observed_top_minus_bottom: 0.0032000000000000004,
+            shuffled_top_minus_bottom: 0.0032,
+            observation_count: 100,
+        };
+        assert!(
+            noise.observed_top_minus_bottom > noise.shuffled_top_minus_bottom,
+            "precondition: the naive comparison really does say 'greater'"
+        );
+
+        let verdict = verdict(&healthy_quality(), &noise, &VerdictThresholds::default());
+
+        assert_eq!(verdict.recommendation, "revise");
+    }
+
+    #[test]
+    fn an_exactly_zero_spread_is_never_a_continue() {
+        // The fixture's finance_only/60 configuration reported:
+        //   "observed spread 0.00000000 beats the shuffled baseline 0.00000000
+        //    and is positive"
+        // ...which is nonsense on its face, and was true only in float terms.
+        let zero = SignalMetrics {
+            observed_top_minus_bottom: 0.0,
+            shuffled_top_minus_bottom: 0.0,
+            observation_count: 100,
+        };
+
+        assert_eq!(
+            verdict(&healthy_quality(), &zero, &VerdictThresholds::default()).recommendation,
+            "revise"
+        );
+    }
+
+    #[test]
+    fn a_configuration_with_too_few_observations_cannot_be_judged() {
+        // `shuffled_spread` returns 0.0 BY FIAT below 3 observations — it invents
+        // a baseline rather than computing one. A 2-observation configuration
+        // "beating" that fabricated zero is not a finding, and it reported
+        // `continue` on the fixture until this gate existed.
+        let tiny = SignalMetrics {
+            observed_top_minus_bottom: 0.05,
+            shuffled_top_minus_bottom: 0.0,
+            observation_count: 2,
+        };
+
+        let verdict = verdict(&healthy_quality(), &tiny, &VerdictThresholds::default());
+
+        assert_eq!(verdict.recommendation, "expand data");
+        assert!(
+            verdict.reason.contains("only 2 observations"),
+            "got: {}",
+            verdict.reason
+        );
     }
 
     #[test]
@@ -224,6 +322,7 @@ mod tests {
         let excellent_signal = SignalMetrics {
             observed_top_minus_bottom: 0.25,
             shuffled_top_minus_bottom: 0.0001,
+            observation_count: 100,
         };
 
         let verdict = verdict(
@@ -252,6 +351,7 @@ mod tests {
         let weak = SignalMetrics {
             observed_top_minus_bottom: 0.0001,
             shuffled_top_minus_bottom: 0.01,
+            observation_count: 100,
         };
 
         let verdict = verdict(&healthy_quality(), &weak, &VerdictThresholds::default());
@@ -296,6 +396,7 @@ mod tests {
                 &SignalMetrics {
                     observed_top_minus_bottom: -0.01,
                     shuffled_top_minus_bottom: 0.01,
+                    observation_count: 100,
                 },
                 &thresholds,
             ),

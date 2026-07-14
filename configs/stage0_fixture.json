@@ -2,20 +2,56 @@
   "run_id": "stage0_fixture",
   "output_root": "artifacts",
   "generated_at": "2026-07-09T00:00:00Z",
-  "symbols": ["SPY", "QQQ"],
-  "source_sets": ["finance_only", "broad_news", "finance_plus_broad"],
-  "news_windows_minutes": [60, 240],
-  "measurement_horizons_minutes": [60],
+  "symbols": [
+    "SPY",
+    "QQQ"
+  ],
+  "source_sets": [
+    "finance_only",
+    "broad_news",
+    "finance_plus_broad"
+  ],
+  "news_windows_minutes": [
+    60,
+    240
+  ],
+  "measurement_horizons_minutes": [
+    60
+  ],
   "price_interval_minutes": 60,
   "long_quantile": 0.8,
   "short_quantile": 0.2,
-  "costs_bps": [0.0, 5.0, 10.0],
-  "holidays": ["2026-07-03"],
+  "costs_bps": [
+    0.0,
+    5.0,
+    10.0
+  ],
+  "holidays": [
+    "2026-07-03"
+  ],
   "early_closes": {},
   "theme_symbol_map": {
-    "technology": ["QQQ"],
-    "rates": ["SPY", "QQQ"],
-    "housing": ["SPY"]
+    "technology": [
+      "QQQ"
+    ],
+    "rates": [
+      "SPY",
+      "QQQ"
+    ],
+    "housing": [
+      "SPY"
+    ]
   },
-  "macro_symbols": ["SPY", "QQQ"]
+  "macro_symbols": [
+    "SPY",
+    "QQQ"
+  ],
+  "verdict_thresholds": {
+    "max_quarantine_rate": 0.1,
+    "min_lexicon_hit_rate": 0.6,
+    "min_source_coverage": 0.5,
+    "min_articles_per_signal": 1.0,
+    "min_observations": 2,
+    "min_spread_margin": 0.0001
+  }
 }

@@ -44,15 +44,36 @@ pub struct VerdictThresholds {
     /// Below this many articles per signal, there is not enough news to
     /// aggregate -> `expand data`.
     pub min_articles_per_signal: f64,
+    /// Fewer observations than this and a configuration cannot be judged at all
+    /// -> `expand data`. `shuffled_spread` returns 0.0 by fiat below 3
+    /// observations — it invents a baseline rather than computing one — so a
+    /// tiny group can "beat" a fabricated zero and report `continue`.
+    pub min_observations: u32,
+    /// The observed spread must beat the baseline by at least this much.
+    ///
+    /// Without it, `observed > shuffled` is decided by floating-point noise:
+    /// two spreads equal to fifteen decimal places still compare as `>` because
+    /// they were summed in a different order. Three fixture configurations
+    /// reported `continue` on a 1e-18 difference. An edge visible only past the
+    /// 15th decimal place is rounding, not signal.
+    pub min_spread_margin: f64,
 }
 
 impl Default for VerdictThresholds {
     fn default() -> Self {
         Self {
             max_quarantine_rate: 0.10,
-            min_lexicon_hit_rate: 0.20,
+            // Raised from 0.20 when the scorer was replaced (design.md Decision
+            // 20). The old value was calibrated to a broken scorer and the old
+            // scorer cleared it by 0.002. LM+VADER reads ~82% of the real
+            // sample, so this is a real floor now, not a formality.
+            min_lexicon_hit_rate: 0.60,
             min_source_coverage: 0.50,
             min_articles_per_signal: 1.0,
+            min_observations: 30,
+            // 1 basis point. Below this the "edge" is smaller than a rounding
+            // error on a single trade's cost, let alone tradable.
+            min_spread_margin: 0.0001,
         }
     }
 }

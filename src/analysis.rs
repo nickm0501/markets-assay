@@ -214,6 +214,7 @@ pub fn analyze_observations(
             let signal = SignalMetrics {
                 observed_top_minus_bottom: observed,
                 shuffled_top_minus_bottom: shuffled,
+                observation_count: group.len() as u32,
             };
             let decision = verdict(&quality, &signal, &context.thresholds);
 
@@ -342,6 +343,11 @@ mod tests {
                 min_lexicon_hit_rate: 0.0,
                 min_source_coverage: 0.0,
                 min_articles_per_signal: 0.0,
+                // These tests exercise the SIGNAL gates on tiny synthetic
+                // groups; the data-quality and sample-size gates get their own
+                // dedicated tests in verdict.rs.
+                min_observations: 0,
+                min_spread_margin: 0.0,
             },
         }
     }

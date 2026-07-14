@@ -65,12 +65,18 @@ fn run_accepts_checked_in_stage0_config() {
 /// |                     | SectorTheme article). Plus RELEVANCE_RULE_VERSION   |
 /// |                     | bumped to stage1_relevance_v2 for the               |
 /// |                     | constituent->ETF mapping.                          |
+/// | ds_64a221a5a8ec40a7 | Stage 2: the 14-word lexicon was replaced by        |
+/// |                     | Loughran-McDonald + VADER, so every sentiment score |
+/// |                     | changed and SENTIMENT_VERSION bumped.              |
 ///
-/// Through every one of these, the fixture's VERDICTS never moved: 6
-/// configurations, 5 `continue`, 1 `revise`. That is the invariant that matters.
-/// The ids are a content hash and are *supposed* to move when the bytes change.
-const FIXTURE_DATASET_ID: &str = "ds_963e4e90a5a10027";
-const FIXTURE_OBSERVATION_SET_ID: &str = "obs_522f739a42faf2d0";
+/// THE VERDICTS ALSO MOVED, and that one is not cosmetic. Stage 0 through Stage 1
+/// reported "5 continue, 1 revise". **Two of those five were floating-point
+/// noise**: `observed > shuffled` was TRUE for spreads equal to fifteen decimal
+/// places, because they were summed in a different order. The verdict now demands
+/// a `min_spread_margin`, and the honest fixture result is **3 continue, 3
+/// revise**. The number this project quoted for a week was wrong.
+const FIXTURE_DATASET_ID: &str = "ds_64a221a5a8ec40a7";
+const FIXTURE_OBSERVATION_SET_ID: &str = "obs_d410aabf8be6f939";
 
 /// The research loop's output must be unmoved by all of Stage 1's plumbing
 /// work. If the *verdicts* ever change, the refactor broke the science, not
@@ -99,8 +105,8 @@ fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
     // One line per verdict value that actually occurred. `run_all` used to
     // print "revise" as `total - continue`, which folded stop/expand data/
     // expand sources into `revise` the moment the full vocabulary existed.
-    .stdout(predicate::str::contains("decisions_continue=5"))
-    .stdout(predicate::str::contains("decisions_revise=1"));
+    .stdout(predicate::str::contains("decisions_continue=3"))
+    .stdout(predicate::str::contains("decisions_revise=3"));
 }
 
 /// Task 9: the leakage check and inspection tables run on every invocation, not

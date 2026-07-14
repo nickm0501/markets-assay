@@ -63,10 +63,25 @@ fn trace_one_real_article_from_vendor_json_through_to_its_trade() {
         "an overnight article must wait for the session open"
     );
 
-    // The 14-word lexicon found exactly two words it knows — "growth" and
-    // "strong" — in the description, scoring +2/4 = +0.5. It has no idea what
-    // the article says. It is pattern-matching two tokens out of a paragraph.
-    assert!((article.sentiment_score - 0.5).abs() < 1e-9);
+    // Strongly positive: +0.527 under LM+VADER (design.md Decision 20).
+    //
+    // Worth dwelling on, because the lesson CHANGED when the scorer improved.
+    // The old 14-word lexicon scored this +0.5 by matching two tokens ("growth",
+    // "strong") out of a paragraph — a lucky guess. The new scorer reads the
+    // whole thing and lands in almost the same place, because the article
+    // genuinely IS bullish: "Which AI Stocks May Soar After Reaching Record
+    // Highs?", "rebounded with optimism about future growth".
+    //
+    // So this is no longer a story about a stupid scorer. A GOOD scorer reads
+    // this as positive, the strategy goes long, and AVGO falls 2.1% in the hour.
+    // That is not a bug in the reader — that is what it looks like when upbeat
+    // news carries no predictive information. Which is exactly the hypothesis
+    // under test, and exactly why baselines and an untouched holdout exist.
+    assert!(
+        article.sentiment_score > 0.4,
+        "expected a strongly positive read, got {}",
+        article.sentiment_score
+    );
 
     // ---- 3. OBSERVATION: the signal that used it. -------------------------
     let price_bars = source.fetch_price_bars(&config).unwrap();
@@ -91,7 +106,7 @@ fn trace_one_real_article_from_vendor_json_through_to_its_trade() {
     // It is the ONLY eligible article, so the observation's mean sentiment is
     // exactly this article's score. That is what makes the trace unambiguous.
     assert_eq!(observation.article_ids, vec![article.article_id.clone()]);
-    assert!((observation.mean_sentiment - 0.5).abs() < 1e-9);
+    assert!((observation.mean_sentiment - article.sentiment_score).abs() < 1e-9);
 
     // No lookahead: the article was usable strictly before we traded on it.
     assert!(article.available_at <= observation.entry_time);
@@ -127,4 +142,41 @@ fn trace_one_real_article_from_vendor_json_through_to_its_trade() {
     assert!(trade.gross_return < 0.0);
     // Cost is subtracted, never added, for a long.
     assert!((trade.net_return - (trade.gross_return - 10.0 / 10_000.0)).abs() < 1e-9);
+}
+
+/// The empirical claim the Stage 2 plan demanded, pinned.
+///
+/// Stage 1 measured `lexicon_hit_rate = 0.2021` — the 14-word scorer read one
+/// real headline in five. The bake-off promised LM+VADER would fix that. This is
+/// where the promise is kept or broken: if it fails, the scorer regressed and no
+/// downstream number can be trusted.
+#[test]
+fn the_new_scorer_reads_most_of_the_real_sample() {
+    let config = PipelineConfig::load("configs/stage1_saved_sample.json").unwrap();
+    let source = SavedFileSource::new(Path::new("fixtures/saved_sample")).unwrap();
+    let raw = source.fetch_raw_articles(&config).unwrap();
+    let articles = normalize_articles(&config, &raw).unwrap().normalized;
+
+    let hits = articles
+        .iter()
+        .filter(|a| markets::sentiment::has_lexicon_hit(&format!("{} {}", a.title, a.summary)))
+        .count();
+    let rate = hits as f64 / articles.len() as f64;
+
+    assert!(
+        rate > 0.60,
+        "lexicon_hit_rate regressed to {rate:.4}; Stage 1 measured 0.2021 with the \
+         14-word lexicon and the bake-off promised >0.60"
+    );
+}
+
+/// Half of the corpus is GDELT: title only, ~11 words. The old scorer was 94%
+/// blind on it. The new one must actually read a real one.
+#[test]
+fn an_eleven_word_gdelt_headline_still_gets_a_real_score() {
+    // Verbatim from fixtures/saved_sample/gdelt_macro.json.
+    let headline = "CNBC Daily Open : Tariffs led us down a different timeline for interest rates";
+
+    assert!(markets::sentiment::has_lexicon_hit(headline));
+    assert_ne!(markets::sentiment::score_text(headline).score, 0.0);
 }
