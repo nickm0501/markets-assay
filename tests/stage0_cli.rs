@@ -217,3 +217,104 @@ fn run_build_observations_and_extract_observation_set_id(
         .unwrap()
         .to_string()
 }
+
+#[test]
+fn backtest_reruns_with_changed_cost_without_rebuilding_dataset() {
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id =
+        run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    for cost in ["0", "10"] {
+        let mut cmd = Command::cargo_bin("markets").unwrap();
+        cmd.args([
+            "backtest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+            "--observation-set-id",
+            &observation_set_id,
+            "--cost-bps",
+            cost,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backtest_trades="));
+    }
+
+    assert!(
+        temp.path()
+            .join("data")
+            .join("datasets")
+            .join(dataset_id)
+            .join("manifest.json")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("runs/stage0_fixture/reports/backtest_metrics.csv")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("runs/stage0_fixture/reports/trade_log.csv")
+            .exists()
+    );
+}
+
+#[test]
+fn distinct_run_ids_keep_separate_backtest_reports_for_comparison() {
+    // Decision Demo step 6 ("compare both runs") requires that changing a
+    // cost assumption and rerunning does not overwrite the first run's
+    // reports. Passing a distinct --run-id per cost keeps both on disk.
+    let temp = TempDir::new().unwrap();
+    let dataset_id = run_fixture_and_extract_dataset_id(temp.path());
+    let observation_set_id =
+        run_build_observations_and_extract_observation_set_id(temp.path(), &dataset_id);
+
+    for (run_id, cost) in [
+        ("stage0_fixture_cost0", "0"),
+        ("stage0_fixture_cost10", "10"),
+    ] {
+        let mut cmd = Command::cargo_bin("markets").unwrap();
+        cmd.args([
+            "backtest",
+            "--config",
+            "configs/stage0_fixture.json",
+            "--output-root",
+            temp.path().to_str().unwrap(),
+            "--observation-set-id",
+            &observation_set_id,
+            "--cost-bps",
+            cost,
+            "--run-id",
+            run_id,
+        ])
+        .assert()
+        .success();
+    }
+
+    let low_cost_metrics = std::fs::read_to_string(
+        temp.path()
+            .join("runs/stage0_fixture_cost0/reports/backtest_metrics.csv"),
+    )
+    .unwrap();
+    let high_cost_metrics = std::fs::read_to_string(
+        temp.path()
+            .join("runs/stage0_fixture_cost10/reports/backtest_metrics.csv"),
+    )
+    .unwrap();
+
+    assert!(
+        temp.path()
+            .join("runs/stage0_fixture_cost0/config.json")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("runs/stage0_fixture_cost10/config.json")
+            .exists()
+    );
+    assert_ne!(low_cost_metrics, high_cost_metrics);
+}

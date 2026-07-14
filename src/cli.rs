@@ -99,7 +99,22 @@ pub fn run_cli() -> Result<()> {
                 &run_id,
             )
         }
-        Commands::Backtest(args) => print_loaded_config(args.observation.stage, "backtest"),
+        Commands::Backtest(args) => {
+            let config = Stage0Config::load(&args.observation.stage.config)?;
+            let run_id = args
+                .observation
+                .run_id
+                .clone()
+                .unwrap_or_else(|| config.run_id.clone());
+            pipeline::run_backtest_command(
+                &config,
+                args.observation.stage.output_root,
+                args.observation.stage.dry_run,
+                &args.observation.observation_set_id,
+                args.cost_bps,
+                &run_id,
+            )
+        }
     }
 }
 
@@ -109,16 +124,4 @@ fn run_loaded_config(
 ) -> Result<()> {
     let config = Stage0Config::load(&args.config)?;
     runner(&config, args.output_root, args.dry_run)
-}
-
-fn print_loaded_config(args: StageArgs, command_name: &str) -> Result<()> {
-    let mut config = Stage0Config::load(&args.config)?;
-    if let Some(output_root) = args.output_root {
-        config.output_root = output_root.display().to_string();
-    }
-    println!(
-        "command={command_name} run_id={} output_root={} dry_run={}",
-        config.run_id, config.output_root, args.dry_run
-    );
-    Ok(())
 }

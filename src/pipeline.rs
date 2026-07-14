@@ -1,5 +1,6 @@
 use crate::{
     analysis::{analyze_observations, bucket_return_rows, coverage_rows},
+    backtest::run_backtests_by_configuration,
     config::Stage0Config,
     domain::{
         article::{NormalizedArticle, SourceKind},
@@ -313,5 +314,63 @@ fn write_run_manifests(
         run_dir.join("observation_set_manifest.json"),
         &observation_manifest_bytes,
     )?;
+    Ok(())
+}
+
+pub fn run_backtest_command(
+    config: &Stage0Config,
+    output_root: Option<PathBuf>,
+    dry_run: bool,
+    observation_set_id: &str,
+    cost_bps: Option<f64>,
+    run_id: &str,
+) -> Result<()> {
+    let root = output_root.unwrap_or_else(|| PathBuf::from(&config.output_root));
+    let observation_dir = root
+        .join("data")
+        .join("observation_sets")
+        .join(observation_set_id);
+    let observations: Vec<NewsSignalObservation> =
+        read_parquet(&observation_dir.join("news_signal_observations.parquet"))?;
+    let cost_bps = cost_bps.unwrap_or_else(|| config.costs_bps.first().copied().unwrap_or(0.0));
+    let results = run_backtests_by_configuration(
+        run_id,
+        &observations,
+        config.long_quantile,
+        config.short_quantile,
+        cost_bps,
+    );
+    let total_trades: usize = results.iter().map(|result| result.trades.len()).sum();
+    if dry_run {
+        let net_return_sum: f64 = results
+            .iter()
+            .map(|result| result.metrics.net_return_sum)
+            .sum();
+        println!(
+            "backtest dry_run=true configurations={} trades={} net_return_sum={}",
+            results.len(),
+            total_trades,
+            net_return_sum
+        );
+        return Ok(());
+    }
+    let report_dir = root.join("runs").join(run_id).join("reports");
+    fs::create_dir_all(&report_dir)?;
+    let metrics: Vec<_> = results
+        .iter()
+        .map(|result| result.metrics.clone())
+        .collect();
+    let trades: Vec<_> = results
+        .iter()
+        .flat_map(|result| result.trades.clone())
+        .collect();
+    write_csv(&report_dir.join("backtest_metrics.csv"), &metrics)?;
+    write_csv(&report_dir.join("trade_log.csv"), &trades)?;
+    write_run_manifests(config, &root, run_id, observation_set_id)?;
+    println!(
+        "backtest_configurations={} backtest_trades={}",
+        results.len(),
+        total_trades
+    );
     Ok(())
 }

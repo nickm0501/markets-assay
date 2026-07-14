@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod backtest;
 pub mod calendar;
 pub mod cli;
 pub mod config;
