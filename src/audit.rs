@@ -74,9 +74,19 @@ pub fn assert_no_lookahead(
         .collect();
 
     let mut violations = Vec::new();
+    let mut missing = Vec::new();
     for observation in observations {
         for article_id in &observation.article_ids {
             let Some(article) = by_id.get(article_id.as_str()) else {
+                // An observation that cites an article the dataset does not
+                // contain is not something to skip: it means the observation set
+                // and the dataset do not match, and the check would then pass
+                // VACUOUSLY, verifying nothing. That is worse than a red result —
+                // it is a green light with no basis. Fail hard.
+                missing.push(format!(
+                    "observation {} (symbol {}) cites article {}, which is absent from the dataset's normalized articles",
+                    observation.observation_id, observation.symbol, article_id
+                ));
                 continue;
             };
             if article.available_at > observation.entry_time {
@@ -94,6 +104,15 @@ pub fn assert_no_lookahead(
         }
     }
 
+    if !missing.is_empty() {
+        bail!(
+            "DATASET MISMATCH: {} observation/article reference(s) point to articles not in the \
+             normalized set. The no-lookahead check cannot verify what it cannot see, so a \
+             vacuous pass here would be a lie.\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
     if !violations.is_empty() {
         bail!(
             "LOOKAHEAD DETECTED: {} observation(s) use information that did not exist yet. \
@@ -172,6 +191,27 @@ mod tests {
 
         assert!(error.contains("LOOKAHEAD DETECTED"), "got: {error}");
         assert!(error.contains("30 minutes AFTER entry"), "got: {error}");
+    }
+
+    #[test]
+    fn an_observation_citing_an_absent_article_fails_rather_than_passing_vacuously() {
+        // The fail-OPEN trap: if an observation references an article the dataset
+        // does not contain, the old code silently skipped it. Point the check at a
+        // mismatched dataset and it would verify nothing while reporting green.
+        let (mut articles, observations) = fixture_data();
+        let used = observations
+            .iter()
+            .find(|observation| !observation.article_ids.is_empty())
+            .expect("fixture must produce at least one observation with an article");
+        // Drop the article the observation depends on, simulating a dataset that
+        // does not match the observation set.
+        articles.retain(|article| article.article_id != used.article_ids[0]);
+
+        let error = assert_no_lookahead(&articles, &observations)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("DATASET MISMATCH"), "got: {error}");
     }
 
     #[test]
