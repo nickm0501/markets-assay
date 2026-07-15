@@ -105,7 +105,14 @@ fn vader_compound(tokens: &[String]) -> f64 {
         let Some(valence) = VADER.get(token.as_str()).copied() else {
             continue;
         };
-        let negated = index > 0 && NEGATORS.contains(&tokens[index - 1].as_str());
+        // Compare the preceding token with apostrophes stripped. The tokenizer
+        // PRESERVES apostrophes, so a real "isn't" stays "isn't" and would never
+        // match the bare "isnt"/"cant"/"wont" in NEGATORS — the exact contractions
+        // headlines actually use would silently fail to negate.
+        let negated = index > 0 && {
+            let previous = tokens[index - 1].replace('\'', "");
+            NEGATORS.contains(&previous.as_str())
+        };
         total += if negated { -valence * 0.74 } else { valence };
     }
     if total == 0.0 {
@@ -187,6 +194,23 @@ mod tests {
         assert!(
             negated.score < plain.score,
             "negation must reduce the score: plain={} negated={}",
+            plain.score,
+            negated.score
+        );
+    }
+
+    #[test]
+    fn a_contraction_negator_with_an_apostrophe_still_flips_polarity() {
+        // The tokenizer keeps apostrophes, so "isn't" tokenizes to "isn't" — which
+        // never matched the bare "isnt" in NEGATORS. The contractions headlines
+        // actually write ("guidance isn't strong") silently failed to negate.
+        let plain = score_text("guidance is strong");
+        let negated = score_text("guidance isn't strong");
+
+        assert!(plain.score > 0.0);
+        assert!(
+            negated.score < plain.score,
+            "an apostrophe'd negator must reduce the score: plain={} negated={}",
             plain.score,
             negated.score
         );
