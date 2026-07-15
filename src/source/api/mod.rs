@@ -103,32 +103,47 @@ impl NewsSource for ApiSource {
         }
 
         // GDELT needs no key, and rate-limits anyway.
-        let body = client.get(
-            "gdelt",
-            "https://api.gdeltproject.org/api/v2/doc/doc",
-            &[
-                (
-                    "query".to_string(),
-                    "(stocks OR \"federal reserve\" OR inflation OR \"interest rates\") sourcelang:english"
-                        .to_string(),
-                ),
-                (
-                    "startdatetime".to_string(),
-                    format!("{}000000", start.format("%Y%m%d")),
-                ),
-                (
-                    "enddatetime".to_string(),
-                    format!("{}235959", end.format("%Y%m%d")),
-                ),
-                ("mode".to_string(), "ArtList".to_string()),
-                ("maxrecords".to_string(), "250".to_string()),
-                ("format".to_string(), "json".to_string()),
-            ],
-            &[],
-            &format!("gdelt:macro:{start}:{end}"),
-            RateLimit::gdelt(),
-        )?;
-        articles.extend(parse_gdelt(&body)?);
+        //
+        // CHUNK BY DAY. `maxrecords=250` caps the ENTIRE response, not a page — a
+        // single request over a two-year range returns 250 articles total and
+        // nothing complains, the exact "missing data looks like no data" failure
+        // the Alpaca pagination bug already taught us. One request per day keeps
+        // each chunk under the cap and makes any gap visible in the ingest log,
+        // the same shape as the Massive per-symbol loop above.
+        let mut day = start;
+        loop {
+            let body = client.get(
+                "gdelt",
+                "https://api.gdeltproject.org/api/v2/doc/doc",
+                &[
+                    (
+                        "query".to_string(),
+                        "(stocks OR \"federal reserve\" OR inflation OR \"interest rates\") sourcelang:english"
+                            .to_string(),
+                    ),
+                    (
+                        "startdatetime".to_string(),
+                        format!("{}000000", day.format("%Y%m%d")),
+                    ),
+                    (
+                        "enddatetime".to_string(),
+                        format!("{}235959", day.format("%Y%m%d")),
+                    ),
+                    ("mode".to_string(), "ArtList".to_string()),
+                    ("maxrecords".to_string(), "250".to_string()),
+                    ("format".to_string(), "json".to_string()),
+                ],
+                &[],
+                &format!("gdelt:macro:{day}"),
+                RateLimit::gdelt(),
+            )?;
+            articles.extend(parse_gdelt(&body)?);
+            if day >= end {
+                break;
+            }
+            let Some(next) = day.succ_opt() else { break };
+            day = next;
+        }
 
         if articles.is_empty() {
             bail!("the api source returned zero articles; refusing to build an empty dataset");
@@ -184,6 +199,12 @@ impl PriceSource for ApiSource {
                 ("end".to_string(), format!("{end}T23:59:59Z")),
                 ("limit".to_string(), "10000".to_string()),
                 ("adjustment".to_string(), "all".to_string()),
+                // CAVEAT: `iex` is the free feed — a single venue (~2-3% of
+                // consolidated volume), not the SIP tape. Its bars can be thin or
+                // absent for less-liquid names and its prices need not match the
+                // NBBO, so any Stage 3 result that leans on these fill prices must
+                // be read with that in mind. Upgrading to `sip` is a feed change
+                // here and nothing else downstream.
                 ("feed".to_string(), "iex".to_string()),
             ];
             if let Some(t) = &token {
