@@ -2,6 +2,9 @@ target/
 .worktrees/
 artifacts/
 
+# Disposable design-review HTML (design-in-practice skill output). Regenerable; do not commit.
+.lavish/
+
 # Real API keys. Never commit these. `.env.example` is the committed template.
 .env
 .env.*
