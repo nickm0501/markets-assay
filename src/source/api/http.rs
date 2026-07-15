@@ -173,7 +173,7 @@ impl CachingHttpClient {
             };
 
             match status {
-                200 => {
+                200 if serde_json::from_str::<serde_json::Value>(&body).is_ok() => {
                     fs::write(&path, &body)?;
                     self.log.push(IngestLogRow {
                         vendor: vendor.into(),
@@ -187,6 +187,38 @@ impl CachingHttpClient {
                         error: String::new(),
                     });
                     return Ok(body);
+                }
+                // A 200 whose body is empty or not valid JSON is a truncated or
+                // corrupt response, not data. Caching it would POISON the resumable
+                // cache forever: every re-run would replay the broken bytes and
+                // never re-fetch. Treat it as retryable, and never write it to disk.
+                200 => {
+                    let body_error = if body.trim().is_empty() {
+                        "HTTP 200 with an empty body".to_string()
+                    } else {
+                        format!(
+                            "HTTP 200 with an unparseable (non-JSON) body: {}",
+                            body.chars().take(200).collect::<String>()
+                        )
+                    };
+                    if attempts >= limit.max_attempts {
+                        self.log.push(IngestLogRow {
+                            vendor: vendor.into(),
+                            request: cache_key.into(),
+                            status,
+                            attempts,
+                            rate_limited,
+                            from_cache: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            bytes: 0,
+                            error: body_error.clone(),
+                        });
+                        bail!(
+                            "{vendor}: {body_error} after {attempts} attempts. \
+                             Nothing is lost — re-run to resume from the cache."
+                        );
+                    }
+                    sleep(Duration::from_secs(2u64.pow(attempts.min(5))));
                 }
                 // Bad credentials. Retrying five times into a wall wastes minutes
                 // and tells you nothing you did not know on the first attempt.
@@ -337,6 +369,45 @@ mod tests {
         // And the message must tell you the fetch is resumable, because at Stage 3
         // scale the next question is always "do I have to start over?".
         assert!(result.unwrap_err().to_string().contains("re-run to resume"));
+    }
+
+    #[test]
+    fn a_200_with_an_unparseable_body_is_not_cached() {
+        // The poison-cache trap: a truncated or corrupt 200 was written to the
+        // cache and replayed forever — every re-run served the broken bytes and
+        // never re-fetched. An unparseable 200 must fail AND leave no cache entry.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 16\r\n\r\nthis is not json",
+                );
+            }
+        });
+
+        let temp = TempDir::new().unwrap();
+        let mut client = CachingHttpClient::new(temp.path()).unwrap();
+        // One attempt so the test does not sit through the backoff.
+        let limit = RateLimit {
+            requests_per_minute: 6000,
+            max_attempts: 1,
+        };
+        let url = format!("http://{addr}/");
+
+        let result = client.get("massive", &url, &[], &[], "poison-key", limit);
+        handle.join().ok();
+
+        assert!(result.is_err(), "an unparseable 200 must not succeed");
+        assert!(
+            !client.cache_path("poison-key").exists(),
+            "a corrupt 200 body must NOT be written to the resumable cache"
+        );
     }
 
     #[test]
