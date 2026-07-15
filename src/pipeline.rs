@@ -275,13 +275,31 @@ fn build_analysis_context(
     })
 }
 
-/// Writes the Stage 1 inspection artifacts and enforces the leakage guarantee.
+/// Enforces the leakage guarantee, BEFORE anything is written.
 ///
 /// This runs on every analyze/backtest/run — not just in tests — because
 /// design.md Decision 4's no-lookahead promise is only worth something if it is
-/// checked against the data actually in front of us. A violation fails the run:
-/// a leakage bug that still prints a report is worse than no report, because
-/// somebody will believe the report.
+/// checked against the data actually in front of us. A violation fails the run,
+/// and it must fail it *before* any report reaches disk: a leakage bug that
+/// leaves complete-looking reports on disk is worse than no report, because
+/// somebody will believe the report. The old code checked only inside
+/// `write_audit_reports`, which ran AFTER summary.md, trade_log.csv and the
+/// charts were already written — exactly the failure the check's own comment
+/// says must never happen.
+fn check_no_lookahead(
+    root: &Path,
+    dataset_id: &str,
+    observations: &[NewsSignalObservation],
+) -> Result<()> {
+    let dataset_dir = root.join("data").join("datasets").join(dataset_id);
+    let articles: Vec<NormalizedArticle> =
+        read_parquet(&dataset_dir.join("normalized_articles.parquet"))?;
+    assert_no_lookahead(&articles, observations)
+}
+
+/// Writes the Stage 1 inspection artifacts. The leakage guarantee itself is
+/// enforced earlier by `check_no_lookahead`, which every command path must call
+/// before it writes a single report.
 fn write_audit_reports(
     root: &Path,
     run_id: &str,
@@ -294,8 +312,6 @@ fn write_audit_reports(
     let set_aside: Vec<SetAsideArticle> =
         read_parquet(&dataset_dir.join("set_aside_articles.parquet"))?;
 
-    assert_no_lookahead(&articles, observations)?;
-
     let report_dir = root.join("runs").join(run_id).join("reports");
     fs::create_dir_all(&report_dir)?;
     write_csv(
@@ -307,6 +323,47 @@ fn write_audit_reports(
     // hides inside a pile of scope exclusions.
     write_csv(&report_dir.join("set_aside.csv"), &set_aside)?;
     Ok(())
+}
+
+/// COVERAGE GATE (spec: "Mark a run invalid when material coverage gaps violate
+/// its configured minimum"). A run below the floor is NOT deleted — the spec keeps
+/// failed experiments as first-class artifacts, because failure is data — but it is
+/// stamped invalid and its `validity.json` says so. Every command that writes
+/// reports must stamp it: `analyze` and `backtest` previously wrote a full report
+/// set with NO validity stamp, so a coverage-starved standalone run looked exactly
+/// as trustworthy as a complete one. Returns whether the run is valid.
+fn stamp_validity(
+    config: &PipelineConfig,
+    root: &Path,
+    run_id: &str,
+    observations: &[NewsSignalObservation],
+) -> Result<bool> {
+    let covered: std::collections::BTreeSet<&str> =
+        observations.iter().map(|o| o.symbol.as_str()).collect();
+    let coverage = covered.len() as f64 / config.symbols.len().max(1) as f64;
+    let valid = coverage >= config.min_coverage;
+    if !valid {
+        println!(
+            "RUN INVALID: coverage {coverage:.2} is below the configured minimum {:.2} — \
+             only {} of {} symbols produced observations. Artifacts are retained.",
+            config.min_coverage,
+            covered.len(),
+            config.symbols.len()
+        );
+    }
+    let run_dir = root.join("runs").join(run_id);
+    fs::create_dir_all(&run_dir)?;
+    fs::write(
+        run_dir.join("validity.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "valid": valid,
+            "coverage": coverage,
+            "min_coverage": config.min_coverage,
+            "symbols_configured": config.symbols.len(),
+            "symbols_with_observations": covered.len(),
+        }))?,
+    )?;
+    Ok(valid)
 }
 
 /// Spearman rank correlation. Returns 0.0 when there is nothing to compare.
@@ -487,7 +544,7 @@ pub fn run_analyze(
         &observation_manifest.input.dataset_id,
         &observations,
     )?;
-    let summaries = analyze_observations(&observations, &context);
+    let summaries = analyze_observations(&observations, &context)?;
     let continue_count = summaries
         .iter()
         .filter(|summary| summary.recommendation == "continue")
@@ -500,6 +557,9 @@ pub fn run_analyze(
         );
         return Ok(());
     }
+    // Leakage check BEFORE any report is written — a tripped check must leave no
+    // complete-looking artifacts behind.
+    check_no_lookahead(&root, &observation_manifest.input.dataset_id, &observations)?;
     let report_dir = root.join("runs").join(run_id).join("reports");
     fs::create_dir_all(&report_dir)?;
     write_csv(
@@ -521,6 +581,7 @@ pub fn run_analyze(
         &observations,
     )?;
     write_run_manifests(config, &root, run_id, observation_set_id)?;
+    stamp_validity(config, &root, run_id, &observations)?;
     println!(
         "analysis_configurations={} analysis_continue={}",
         summaries.len(),
@@ -641,6 +702,13 @@ pub fn run_backtest_command(
         );
         return Ok(());
     }
+    // The leakage check must run BEFORE the trade log is written — a trade log is
+    // exactly the artifact somebody would believe, so it must never survive a
+    // failed no-lookahead check on disk. `backtest` was previously the one path
+    // that could emit a trade log without ever verifying no-lookahead.
+    let observation_manifest: ObservationSetManifest =
+        serde_json::from_slice(&fs::read(observation_dir.join("manifest.json"))?)?;
+    check_no_lookahead(&root, &observation_manifest.input.dataset_id, &observations)?;
     let report_dir = root.join("runs").join(run_id).join("reports");
     fs::create_dir_all(&report_dir)?;
     let metrics: Vec<_> = results
@@ -653,12 +721,6 @@ pub fn run_backtest_command(
         .collect();
     write_csv(&report_dir.join("backtest_metrics.csv"), &metrics)?;
     write_csv(&report_dir.join("trade_log.csv"), &trades)?;
-    // The leakage check lives in write_audit_reports, so it must run here too.
-    // Without this, `backtest` was the one path that could produce a trade log
-    // WITHOUT ever verifying no-lookahead — and a trade log is exactly the
-    // artifact somebody would believe.
-    let observation_manifest: ObservationSetManifest =
-        serde_json::from_slice(&fs::read(observation_dir.join("manifest.json"))?)?;
     write_audit_reports(
         &root,
         run_id,
@@ -666,6 +728,7 @@ pub fn run_backtest_command(
         &observations,
     )?;
     write_run_manifests(config, &root, run_id, observation_set_id)?;
+    stamp_validity(config, &root, run_id, &observations)?;
     println!(
         "backtest_configurations={} backtest_trades={}",
         results.len(),
@@ -704,7 +767,7 @@ pub fn run_all(
             .join("news_signal_observations.parquet"),
     )?;
     let context = build_analysis_context(config, &root, &dataset_id, &observations)?;
-    let analyses = analyze_observations(&observations, &context);
+    let analyses = analyze_observations(&observations, &context)?;
     let cost_bps = config.costs_bps.first().copied().unwrap_or(0.0);
     let backtests = run_backtests_by_configuration(
         run_id,
@@ -726,6 +789,10 @@ pub fn run_all(
         .iter()
         .flat_map(|result| result.trades.clone())
         .collect();
+    // Leakage check BEFORE any report or chart is written. If it trips, the run
+    // errors and leaves NO complete-looking artifacts behind — the whole point of
+    // the guarantee.
+    check_no_lookahead(&root, &dataset_id, &observations)?;
     let run_dir = root.join("runs").join(run_id);
     let report_dir = run_dir.join("reports");
     let chart_dir = run_dir.join("charts");
@@ -757,36 +824,9 @@ pub fn run_all(
     // commands write (Task 7/8's write_run_manifests) — required by the
     // spec's Stored Data section and asserted by Task 10 Step 6's expected
     // file listing.
-    // COVERAGE GATE (spec: "Mark a run invalid when material coverage gaps
-    // violate its configured minimum"). A run below the floor is NOT deleted —
-    // the spec keeps failed experiments as first-class artifacts, because failure
-    // is data — but it is stamped invalid and its summary says so at the top. A
-    // report nobody flagged is a report somebody will believe.
-    let covered: std::collections::BTreeSet<&str> =
-        observations.iter().map(|o| o.symbol.as_str()).collect();
-    let coverage = covered.len() as f64 / config.symbols.len().max(1) as f64;
-    let valid = coverage >= config.min_coverage;
-    if !valid {
-        println!(
-            "RUN INVALID: coverage {coverage:.2} is below the configured minimum {:.2} —              only {} of {} symbols produced observations. Artifacts are retained.",
-            config.min_coverage,
-            covered.len(),
-            config.symbols.len()
-        );
-    }
-
     write_audit_reports(&root, run_id, &dataset_id, &observations)?;
     write_run_manifests(config, &root, run_id, &observation_set_id)?;
-    fs::write(
-        run_dir.join("validity.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "valid": valid,
-            "coverage": coverage,
-            "min_coverage": config.min_coverage,
-            "symbols_configured": config.symbols.len(),
-            "symbols_with_observations": covered.len(),
-        }))?,
-    )?;
+    stamp_validity(config, &root, run_id, &observations)?;
 
     // Charts illustrate one representative configuration for the Stage 0 demo.
     // The summary table above, not the chart, is the source of truth across
@@ -809,6 +849,11 @@ pub fn run_all(
         .collect();
     write_bucket_chart(&chart_dir.join("bucket_returns.svg"), &primary_bucket_rows)?;
 
+    // The headline equity curve is the SENTIMENT strategy on the HOLDOUT split —
+    // the spec's primary result is held-out performance. Matching on the
+    // configuration key alone returned the first result for that key, which is the
+    // sentiment DEVELOPMENT curve (the split thresholds were fitted on), quietly
+    // plotting an in-sample equity line as if it were the finding.
     let primary_trades = backtests
         .iter()
         .find(|result| {
@@ -817,6 +862,8 @@ pub fn run_all(
                 result.metrics.measurement_horizon_minutes,
                 result.metrics.source_set.clone(),
             ) == primary_key
+                && result.metrics.strategy == "sentiment"
+                && result.metrics.split == "holdout"
         })
         .map(|result| result.trades.as_slice())
         .unwrap_or(&[]);

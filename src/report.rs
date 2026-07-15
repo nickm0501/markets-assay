@@ -20,6 +20,12 @@ pub fn write_summary(
         .iter()
         .filter(|analysis| analysis.recommendation == "continue")
         .count();
+    let tested = analyses.len();
+    let significant_after_fdr = analyses
+        .iter()
+        .filter(|analysis| analysis.significant_after_fdr)
+        .count();
+    let expected_false_by_chance = tested as f64 * 0.05;
     let quarantine_rate = analyses
         .first()
         .map(|analysis| analysis.quarantine_rate)
@@ -43,6 +49,15 @@ pub fn write_summary(
          observation_set_id: {observation_set_id}\n\n\
          configurations: {}\n\n\
          continue: {continue_count}\n\n\
+         ## Multiple Testing\n\n\
+         {tested} configurations were tested. At an uncorrected p < 0.05, roughly\n\
+         {expected_false_by_chance:.1} of them would report a false `continue` on pure noise by\n\
+         chance alone. To control that, per-configuration p-values come from a\n\
+         BLOCK-permutation null (valid on overlapping, fanned-out observations) and\n\
+         are corrected across the whole matrix with Benjamini-Hochberg (FDR q = 0.05).\n\
+         {significant_after_fdr} configuration(s) are significant after correction; a `continue`\n\
+         requires surviving it. The `null_p_value` and `significant_after_fdr` columns\n\
+         below show each configuration's standing.\n\n\
          ## Data Quality\n\n\
          Data-quality gates are evaluated BEFORE signal gates: a spread computed over\n\
          unusable data is not a weak result, it is not a result at all.\n\n\
@@ -58,8 +73,8 @@ pub fn write_summary(
          Each row is one (news_window, measurement_horizon, source_set) configuration.\n\
          Configurations are never blended into a single verdict (design.md Decision 1).\n\
          Long and short sides are reported separately as well as combined (spec Backtest Rules).\n\n\
-         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | reason | sentiment_net | best_baseline | best_baseline_net | degenerate | articles_per_signal | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+         | news_window_minutes | measurement_horizon_minutes | source_set | observations | recommendation | reason | sentiment_net | best_baseline | best_baseline_net | degenerate | articles_per_signal | observed_top_minus_bottom | shuffled_top_minus_bottom | pearson | null_p_value | significant_after_fdr | trades | net_return_sum | win_rate | long_trades | long_net_return_sum | long_win_rate | short_trades | short_net_return_sum | short_win_rate |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         analyses.len(),
     );
     for analysis in analyses {
@@ -94,7 +109,7 @@ pub fn write_summary(
             })
             .unwrap_or((0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0));
         text.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.6} | {} | {:.6} | {} | {:.2} | {:.6} | {:.6} | {:.4} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.6} | {} | {:.6} | {} | {:.2} | {:.6} | {:.6} | {:.4} | {:.6} | {} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} | {} | {:.6} | {:.2} |\n",
             analysis.news_window_minutes,
             analysis.measurement_horizon_minutes,
             analysis.source_set,
@@ -109,6 +124,8 @@ pub fn write_summary(
             analysis.observed_top_minus_bottom,
             analysis.shuffled_top_minus_bottom,
             analysis.pearson_correlation,
+            analysis.null_p_value,
+            analysis.significant_after_fdr,
             trade_count,
             net_return_sum,
             win_rate,
@@ -188,6 +205,9 @@ mod tests {
                 observed_top_minus_bottom: 0.01,
                 shuffled_top_minus_bottom: 0.0,
                 shuffled_p95: 0.0,
+                null_p_value: 0.004,
+                significant_after_fdr: true,
+                judged_on_holdout: true,
                 pearson_correlation: 0.4,
                 quarantine_rate: 0.0,
                 articles_per_signal: 2.0,
@@ -209,6 +229,9 @@ mod tests {
                 observed_top_minus_bottom: -0.002,
                 shuffled_top_minus_bottom: 0.001,
                 shuffled_p95: 0.002,
+                null_p_value: 0.6,
+                significant_after_fdr: false,
+                judged_on_holdout: true,
                 pearson_correlation: -0.1,
                 quarantine_rate: 0.0,
                 articles_per_signal: 2.0,

@@ -7,6 +7,7 @@ use crate::{
     },
     verdict::{DataQualityMetrics, SignalMetrics, verdict},
 };
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +25,21 @@ pub struct AnalysisSummary {
     /// MEAN (the spec's literal bar); this column tells a reader whether the
     /// result would also survive a real significance test.
     pub shuffled_p95: f64,
+    /// Empirical p-value from the BLOCK-permutation null: the share of null draws
+    /// whose spread meets or beats the observed one (add-one corrected). The null
+    /// permutes whole time-blocks, not individual observations, so it is valid on
+    /// the overlapping/fanned-out observations real data produces — where an
+    /// i.i.d. shuffle fires ~30% of the time on pure noise.
+    pub null_p_value: f64,
+    /// Whether this configuration's p-value survives Benjamini-Hochberg FDR
+    /// control across the whole configuration matrix. A `continue` requires this:
+    /// gating each of ~48 configurations at p < 0.05 independently expects ~2.4
+    /// false continues on pure noise.
+    pub significant_after_fdr: bool,
+    /// False when the held-out split had fewer than 3 observations and the spread
+    /// was judged on the FULL group instead — an in-sample measurement a reader
+    /// must be able to see and discount.
+    pub judged_on_holdout: bool,
     pub pearson_correlation: f64,
     pub quarantine_rate: f64,
     pub articles_per_signal: f64,
@@ -173,112 +189,198 @@ pub fn bucket_return_rows(
 pub fn analyze_observations(
     observations: &[NewsSignalObservation],
     context: &AnalysisContext,
-) -> Vec<AnalysisSummary> {
-    configuration_groups(observations)
-        .into_iter()
-        .map(|(key, group)| {
-            // THE SPREAD IS MEASURED ON THE HOLDOUT.
-            //
-            // The spec's success gate is explicit: "the HELD-OUT top-minus-bottom
-            // sentiment return spread is positive". Measuring it across the whole
-            // sample means measuring it partly on the data the thresholds were
-            // fitted to — marking your own homework.
-            //
-            // Both observed and null share the same bucketing, so the verdict
-            // isolates the sentiment ORDERING rather than a difference in how the
-            // two spreads carve up the group.
-            let (_development, holdout) =
-                crate::backtest::split_chronologically(&group, context.development_fraction);
-            let judged: &[&NewsSignalObservation] =
-                if holdout.len() >= 3 { &holdout } else { &group };
-            let observed = top_minus_bottom(&sentiment_return_pairs(judged));
-            let (shuffled, shuffled_p95) = shuffled_spread(judged, context.seed);
+) -> Result<Vec<AnalysisSummary>> {
+    // First pass: everything per configuration EXCEPT the family-wide FDR
+    // decision, which cannot be made until every configuration's p-value is known.
+    let mut summaries: Vec<AnalysisSummary> = Vec::new();
+    for (key, group) in configuration_groups(observations) {
+        // THE SPREAD IS MEASURED ON THE HOLDOUT.
+        //
+        // The spec's success gate is explicit: "the HELD-OUT top-minus-bottom
+        // sentiment return spread is positive". Measuring it across the whole
+        // sample means measuring it partly on the data the thresholds were
+        // fitted to — marking your own homework.
+        //
+        // Both observed and null share the same bucketing, so the verdict
+        // isolates the sentiment ORDERING rather than a difference in how the
+        // two spreads carve up the group.
+        let (development, holdout) =
+            crate::backtest::split_chronologically(&group, context.development_fraction);
+        let judged_on_holdout = holdout.len() >= 3;
+        let judged: &[&NewsSignalObservation] = if judged_on_holdout { &holdout } else { &group };
+        let observed = top_minus_bottom(&sentiment_return_pairs(judged));
+        let (shuffled, shuffled_p95, null_p_value) =
+            shuffled_spread(judged, observed, context.seed);
 
-            let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
-            let degenerate = is_degenerate(
-                &sentiments,
-                quantile_of(&sentiments, context.long_quantile),
-                quantile_of(&sentiments, context.short_quantile),
-                context.max_modal_share,
-            );
-            let articles_per_signal = if group.is_empty() {
-                0.0
-            } else {
-                group
-                    .iter()
-                    .map(|row| row.article_count as f64)
-                    .sum::<f64>()
-                    / group.len() as f64
-            };
-            // How rich is this source mixture actually, against how rich it
-            // claims to be? A `finance_plus_broad` set that only ever draws on
-            // one publisher is not the mixture it advertises.
-            //
-            // This counts DISTINCT sources contributing anywhere in the
-            // configuration, not sources-per-signal. Those are different
-            // questions: a single article per signal is normal in a small
-            // sample and says nothing about whether the mixture is thin.
-            let expected = context
-                .expected_sources
-                .get(&key.2)
-                .copied()
-                .unwrap_or(0)
-                .max(1) as f64;
-            let contributing: BTreeSet<&str> = group
+        // DEGENERACY IS JUDGED ON THE DEVELOPMENT SPLIT — the same data, and the
+        // same quantiles, the backtest uses. Judging it on whole-group quantiles
+        // (as this once did) let the two disagree: analysis could call a
+        // configuration degenerate while the backtest happily traded it, or the
+        // reverse. Fall back to the whole group only when there is no development
+        // split at all (development_fraction == 0), where there is nothing else to
+        // use.
+        let degeneracy_sentiments: Vec<f64> = if development.is_empty() {
+            group.iter().map(|row| row.mean_sentiment).collect()
+        } else {
+            development.iter().map(|row| row.mean_sentiment).collect()
+        };
+        let degenerate = is_degenerate(
+            &degeneracy_sentiments,
+            quantile_of(&degeneracy_sentiments, context.long_quantile),
+            quantile_of(&degeneracy_sentiments, context.short_quantile),
+            context.max_modal_share,
+        );
+        let articles_per_signal = if group.is_empty() {
+            0.0
+        } else {
+            group
                 .iter()
-                .flat_map(|row| row.article_ids.iter())
-                .filter_map(|article_id| {
-                    context.article_sources.get(article_id).map(String::as_str)
-                })
-                .collect();
-            let source_set_coverage = (contributing.len() as f64 / expected).min(1.0);
+                .map(|row| row.article_count as f64)
+                .sum::<f64>()
+                / group.len() as f64
+        };
+        // How rich is this source mixture actually, against how rich it
+        // claims to be? A `finance_plus_broad` set that only ever draws on
+        // one publisher is not the mixture it advertises.
+        //
+        // This counts DISTINCT sources contributing anywhere in the
+        // configuration, not sources-per-signal. Those are different
+        // questions: a single article per signal is normal in a small
+        // sample and says nothing about whether the mixture is thin.
+        let expected = context
+            .expected_sources
+            .get(&key.2)
+            .copied()
+            .unwrap_or(0)
+            .max(1) as f64;
+        let contributing: BTreeSet<&str> = group
+            .iter()
+            .flat_map(|row| row.article_ids.iter())
+            .filter_map(|article_id| context.article_sources.get(article_id).map(String::as_str))
+            .collect();
+        let source_set_coverage = (contributing.len() as f64 / expected).min(1.0);
 
-            let quality = DataQualityMetrics {
-                quarantine_rate: context.quarantine_rate,
-                articles_per_signal,
-                source_set_coverage,
-                lexicon_hit_rate: context.lexicon_hit_rate,
-                degenerate,
-            };
-            let (sentiment_net, best_baseline_net, best_baseline_name) = context
-                .strategy_nets
-                .get(&key)
-                .cloned()
-                .unwrap_or((0.0, f64::NEG_INFINITY, "none".to_string()));
-            let signal = SignalMetrics {
-                observed_top_minus_bottom: observed,
-                shuffled_top_minus_bottom: shuffled,
-                shuffled_p95,
-                observation_count: judged.len() as u32,
-                sentiment_net_return: sentiment_net,
-                best_baseline_net_return: best_baseline_net,
-                best_baseline_name,
-            };
-            let decision = verdict(&quality, &signal, &context.thresholds);
+        let quality = DataQualityMetrics {
+            quarantine_rate: context.quarantine_rate,
+            articles_per_signal,
+            source_set_coverage,
+            lexicon_hit_rate: context.lexicon_hit_rate,
+            degenerate,
+        };
+        // A MISSING BASELINE COMPARISON IS A HARD ERROR, not a default.
+        //
+        // Defaulting to (0.0, NEG_INFINITY) made every configuration trivially
+        // "beat" its baseline, silently DISABLING the baseline gate the moment a
+        // key-construction bug made the lookup miss. `strategy_comparison` produces
+        // an entry for every configuration with holdout results, so a miss means a
+        // real defect — fail loudly instead of reporting an unearned `continue`.
+        let (sentiment_net, best_baseline_net, best_baseline_name) =
+            context.strategy_nets.get(&key).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no backtest strategy comparison for configuration {key:?}; the baseline gate \
+                     cannot be applied, and defaulting it open would silently disable the check"
+                )
+            })?;
+        let signal = SignalMetrics {
+            observed_top_minus_bottom: observed,
+            shuffled_top_minus_bottom: shuffled,
+            shuffled_p95,
+            observation_count: judged.len() as u32,
+            sentiment_net_return: sentiment_net,
+            best_baseline_net_return: best_baseline_net,
+            best_baseline_name,
+        };
+        let decision = verdict(&quality, &signal, &context.thresholds);
+        let reason = if judged_on_holdout {
+            decision.reason
+        } else {
+            format!(
+                "[SMALL HOLDOUT: spread judged on the full group, not a held-out split] {}",
+                decision.reason
+            )
+        };
 
-            AnalysisSummary {
-                news_window_minutes: key.0,
-                measurement_horizon_minutes: key.1,
-                source_set: key.2,
-                observation_count: group.len() as u32,
-                observed_top_minus_bottom: observed,
-                shuffled_top_minus_bottom: shuffled,
-                shuffled_p95,
-                pearson_correlation: pearson(&group),
-                quarantine_rate: quality.quarantine_rate,
-                articles_per_signal: quality.articles_per_signal,
-                source_set_coverage: quality.source_set_coverage,
-                lexicon_hit_rate: quality.lexicon_hit_rate,
-                degenerate,
-                vendor_agreement: context.vendor_agreement,
-                sentiment_net_return: signal.sentiment_net_return,
-                best_baseline_net_return: signal.best_baseline_net_return,
-                best_baseline_name: signal.best_baseline_name.clone(),
-                recommendation: decision.recommendation,
-                reason: decision.reason,
-            }
-        })
-        .collect()
+        summaries.push(AnalysisSummary {
+            news_window_minutes: key.0,
+            measurement_horizon_minutes: key.1,
+            source_set: key.2,
+            observation_count: group.len() as u32,
+            observed_top_minus_bottom: observed,
+            shuffled_top_minus_bottom: shuffled,
+            shuffled_p95,
+            null_p_value,
+            significant_after_fdr: false,
+            judged_on_holdout,
+            pearson_correlation: pearson(&group),
+            quarantine_rate: quality.quarantine_rate,
+            articles_per_signal: quality.articles_per_signal,
+            source_set_coverage: quality.source_set_coverage,
+            lexicon_hit_rate: quality.lexicon_hit_rate,
+            degenerate,
+            vendor_agreement: context.vendor_agreement,
+            sentiment_net_return: signal.sentiment_net_return,
+            best_baseline_net_return: signal.best_baseline_net_return,
+            best_baseline_name: signal.best_baseline_name.clone(),
+            recommendation: decision.recommendation,
+            reason,
+        });
+    }
+
+    // Second pass: Benjamini-Hochberg across the whole matrix, which can only run
+    // once every p-value is in hand.
+    apply_benjamini_hochberg(&mut summaries, FDR_Q);
+    Ok(summaries)
+}
+
+/// The false-discovery rate the configuration matrix is controlled at. 0.05 keeps
+/// the family-wide expectation of false `continue`s in line with the per-test bar
+/// a single configuration faces.
+const FDR_Q: f64 = 0.05;
+
+/// Benjamini-Hochberg across the configuration matrix.
+///
+/// Each configuration is one hypothesis test. Gating each at p < 0.05
+/// independently means a ~48-configuration matrix expects ~2.4 false `continue`s
+/// on pure noise even with a valid null. BH controls the false-DISCOVERY rate
+/// across the family: sort the p-values ascending, find the largest rank `k` whose
+/// p-value clears `(k/m)·q`, and only tests at or below that p-value are
+/// significant. A `continue` that clears its own null but not the family-wide
+/// correction is downgraded to `revise` — across a matrix this size it is as
+/// likely to be luck as signal.
+fn apply_benjamini_hochberg(summaries: &mut [AnalysisSummary], q: f64) {
+    let m = summaries.len();
+    if m == 0 {
+        return;
+    }
+    let mut ranked: Vec<(usize, f64)> = summaries
+        .iter()
+        .enumerate()
+        .map(|(i, summary)| (i, summary.null_p_value))
+        .collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let mut cutoff_rank = 0usize;
+    for (rank, (_, p)) in ranked.iter().enumerate() {
+        let k = rank + 1;
+        if *p <= (k as f64 / m as f64) * q {
+            cutoff_rank = k;
+        }
+    }
+    let threshold = if cutoff_rank == 0 {
+        f64::NEG_INFINITY
+    } else {
+        ranked[cutoff_rank - 1].1
+    };
+    for summary in summaries.iter_mut() {
+        summary.significant_after_fdr = summary.null_p_value <= threshold;
+        if summary.recommendation == "continue" && !summary.significant_after_fdr {
+            summary.reason = format!(
+                "downgraded from continue: p-value {:.4} is not significant after Benjamini-Hochberg \
+                 FDR control across {} configurations (q = {:.2}). Prior reason: {}",
+                summary.null_p_value, m, q, summary.reason
+            );
+            summary.recommendation = "revise".to_string();
+        }
+    }
 }
 
 fn quantile_of(values: &[f64], q: f64) -> f64 {
@@ -318,63 +420,102 @@ fn top_minus_bottom(pairs: &[(f64, f64)]) -> f64 {
 /// noisy one. The bar that `continue` must clear should not itself be a coin flip.
 const NULL_PERMUTATIONS: usize = 200;
 
-/// The null hypothesis: sentiment scores paired with the WRONG returns.
+/// The null hypothesis: sentiment scores paired with the WRONG returns — but
+/// permuted in BLOCKS, because this pipeline's observations are not exchangeable.
 ///
-/// **This was a live bug from Stage 0 until 2026-07-14.** The old implementation
-/// was `sentiments[(idx + 1) % len]` — a *rotation by one*, not a shuffle. It
-/// paired each return with its NEIGHBOUR's sentiment, and neighbouring
-/// observations have similar sentiment. Worse, the more observations you have,
-/// the closer adjacent sentiments get: at n=500 they differ by 0.004. So the
-/// "null" converged on the real hypothesis as the sample grew, the margin
-/// collapsed to zero, and **a genuine signal was rejected more readily the more
-/// evidence you gave it**. A power sweep caught it: detection got *worse* with
-/// more data, which is impossible for a sound detector.
+/// **The i.i.d. shuffle this replaced was invalid on real data.** An i.i.d.
+/// Fisher-Yates shuffle assumes each observation is independent. This pipeline's
+/// own construction guarantees they are not: `normalize.rs` fans one macro article
+/// out to every macro symbol; a news window several bars wide puts the same
+/// article in consecutive observations; and a horizon several bars wide makes
+/// adjacent `future_return`s share most of their hours. Under that clustering the
+/// *observed* spread has fat tails an i.i.d. null cannot see, so its p95 sits far
+/// too low — an adversarial probe fired the significance gate ~30% of the time on
+/// pure noise built with exactly this structure.
 ///
-/// A real shuffle destroys the article↔return pairing while preserving the score
-/// *distribution*, which is precisely what isolates whether the ORDERING carries
-/// information.
+/// A block permutation fixes it. Observations are ordered by `signal_time` and
+/// partitioned into blocks spanning `news_window + horizon` minutes — the exact
+/// reach over which one article touches adjacent observations and adjacent returns
+/// overlap. Same-time symbols land in the same block, which absorbs the macro
+/// fan-out. Each null draw permutes whole BLOCKS: within-block structure is
+/// preserved, only the alignment of sentiment-blocks to return-positions is
+/// randomized. The null then carries the same autocorrelation the real data does,
+/// so p95 reflects the TRUE number of independent observations rather than the
+/// inflated count of overlapping ones.
 ///
-/// Returns the mean spread across `NULL_PERMUTATIONS` shuffles, and the 95th
-/// percentile — the bar a result would need to clear to be significant rather
-/// than merely lucky.
-fn shuffled_spread(group: &[&NewsSignalObservation], seed: u64) -> (f64, f64) {
+/// Returns the mean null spread, its 95th percentile (the significance bar), and
+/// an add-one-corrected empirical p-value (share of null draws ≥ observed).
+fn shuffled_spread(group: &[&NewsSignalObservation], observed: f64, seed: u64) -> (f64, f64, f64) {
     if group.len() < 3 {
         // Not a baseline — an admission that we cannot compute one. The verdict's
         // `min_observations` gate exists so this value is never actually compared
-        // against anything.
-        return (0.0, 0.0);
+        // against anything. p = 1.0: nothing here is significant.
+        return (0.0, 0.0, 1.0);
     }
-    let sentiments: Vec<f64> = group.iter().map(|row| row.mean_sentiment).collect();
-    let returns: Vec<f64> = group.iter().map(|row| row.future_return).collect();
+    // Order by time so blocks are contiguous, and same-`signal_time` observations
+    // (the macro fan-out across symbols) share a block.
+    let mut ordered: Vec<&NewsSignalObservation> = group.to_vec();
+    ordered.sort_by(|a, b| {
+        (a.signal_time, a.observation_id.as_str()).cmp(&(b.signal_time, b.observation_id.as_str()))
+    });
+    let returns: Vec<f64> = ordered.iter().map(|row| row.future_return).collect();
+
+    // All observations in a configuration share one window and one horizon, so the
+    // block length is a property of the configuration.
+    let block_len_minutes =
+        (ordered[0].news_window_minutes + ordered[0].measurement_horizon_minutes).max(1);
+    let start = ordered[0].signal_time;
+    let mut blocks: Vec<Vec<f64>> = Vec::new();
+    let mut current_bin: i64 = i64::MIN;
+    for row in &ordered {
+        let bin = (row.signal_time - start).num_minutes() / block_len_minutes;
+        if bin != current_bin {
+            blocks.push(Vec::new());
+            current_bin = bin;
+        }
+        blocks.last_mut().unwrap().push(row.mean_sentiment);
+    }
 
     let mut spreads = Vec::with_capacity(NULL_PERMUTATIONS);
+    let mut at_or_above_observed = 0usize;
     for permutation in 0..NULL_PERMUTATIONS {
-        let mut shuffled = sentiments.clone();
+        // Fisher-Yates over BLOCK ORDER, not over individual observations.
+        let mut order: Vec<usize> = (0..blocks.len()).collect();
         let mut state = seed
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(permutation as u64);
-        // Fisher-Yates. A real permutation, not a rotation.
-        for i in (1..shuffled.len()).rev() {
+        for i in (1..order.len()).rev() {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = state;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
             let j = (z % (i as u64 + 1)) as usize;
-            shuffled.swap(i, j);
+            order.swap(i, j);
         }
-        let pairs: Vec<(f64, f64)> = shuffled
+        let permuted: Vec<f64> = order
+            .iter()
+            .flat_map(|&block| blocks[block].iter().copied())
+            .collect();
+        let pairs: Vec<(f64, f64)> = permuted
             .iter()
             .copied()
             .zip(returns.iter().copied())
             .collect();
-        spreads.push(top_minus_bottom(&pairs));
+        let spread = top_minus_bottom(&pairs);
+        if spread >= observed {
+            at_or_above_observed += 1;
+        }
+        spreads.push(spread);
     }
 
     let mean_spread = spreads.iter().sum::<f64>() / spreads.len() as f64;
     spreads.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p95 = spreads[((spreads.len() as f64 * 0.95) as usize).min(spreads.len() - 1)];
-    (mean_spread, p95)
+    // Add-one correction: the observed statistic is itself one draw from the null,
+    // so a permutation p-value can never be exactly zero.
+    let p_value = (at_or_above_observed as f64 + 1.0) / (NULL_PERMUTATIONS as f64 + 1.0);
+    (mean_spread, p95, p_value)
 }
 
 fn pearson(group: &[&NewsSignalObservation]) -> f64 {
@@ -413,14 +554,37 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::{
-        config::PipelineConfig, domain::observation::NewsSignalObservation,
-        normalize::normalize_articles, observations::build_observations,
+        backtest::{BacktestParams, run_backtests_by_configuration, strategy_comparison},
+        config::PipelineConfig,
+        domain::observation::NewsSignalObservation,
+        normalize::normalize_articles,
+        observations::build_observations,
         source::fixture::generate_fixture,
     };
 
     /// A context with clean data, so these tests exercise the SIGNAL gates.
     /// The data-quality gates get their own dedicated tests in `verdict.rs`.
-    fn healthy_context() -> AnalysisContext {
+    ///
+    /// `strategy_nets` is built from a real backtest over the same observations,
+    /// because a missing entry is now a hard error (defaulting the baseline gate
+    /// open would silently disable it).
+    fn healthy_context(observations: &[NewsSignalObservation]) -> AnalysisContext {
+        // 0.0 = no development split, so the spread is measured over the whole
+        // group. These tests are about the SPREAD MATH, not the split; the split
+        // has its own test (tests/no_threshold_lookahead.rs).
+        let development_fraction = 0.0;
+        let results = run_backtests_by_configuration(
+            "analysis_test",
+            observations,
+            BacktestParams {
+                long_quantile: 0.8,
+                short_quantile: 0.2,
+                cost_bps: 0.0,
+                max_modal_share: 1.0,
+                seed: 42,
+                development_fraction,
+            },
+        );
         AnalysisContext {
             quarantine_rate: 0.0,
             lexicon_hit_rate: 1.0,
@@ -431,12 +595,9 @@ mod tests {
                 ("finance_plus_broad".to_string(), 1),
             ]),
             article_sources: BTreeMap::new(),
-            strategy_nets: BTreeMap::new(),
+            strategy_nets: strategy_comparison(&results),
             seed: 42,
-            // 0.0 = no development split, so the spread is measured over the whole
-            // group. These tests are about the SPREAD MATH, not the split; the
-            // split has its own test (tests/no_threshold_lookahead.rs).
-            development_fraction: 0.0,
+            development_fraction,
             long_quantile: 0.8,
             short_quantile: 0.2,
             max_modal_share: 1.0,
@@ -545,8 +706,10 @@ mod tests {
 
     #[test]
     fn analyze_observations_returns_one_summary_per_configuration_not_pooled() {
-        let summaries = analyze_observations(&observations(), &healthy_context());
-        let configuration_count = configuration_groups(&observations()).len();
+        let observations = observations();
+        let summaries =
+            analyze_observations(&observations, &healthy_context(&observations)).unwrap();
+        let configuration_count = configuration_groups(&observations).len();
 
         assert_eq!(summaries.len(), configuration_count);
         assert!(configuration_count > 1);
@@ -554,7 +717,9 @@ mod tests {
 
     #[test]
     fn shuffled_baseline_is_worse_than_observed_spread_for_the_finance_only_configuration() {
-        let summaries = analyze_observations(&observations(), &healthy_context());
+        let observations = observations();
+        let summaries =
+            analyze_observations(&observations, &healthy_context(&observations)).unwrap();
         let summary = summaries
             .iter()
             .find(|summary| {
@@ -580,7 +745,7 @@ mod tests {
             .map(|i| observation_with_sentiment_and_return(i as f64, i as f64 * 10.0))
             .collect();
 
-        let summaries = analyze_observations(&group, &healthy_context());
+        let summaries = analyze_observations(&group, &healthy_context(&group)).unwrap();
 
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].observation_count, 7);

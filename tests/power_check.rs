@@ -126,7 +126,7 @@ fn the_pipeline_says_continue_when_a_real_signal_is_actually_there() {
     let observations = planted_signal(200, 0.02);
     let context = context_for(&observations);
 
-    let summaries = analyze_observations(&observations, &context);
+    let summaries = analyze_observations(&observations, &context).unwrap();
 
     assert_eq!(summaries.len(), 1);
     let summary = &summaries[0];
@@ -150,7 +150,7 @@ fn the_pipeline_says_revise_when_the_same_machinery_sees_pure_noise() {
     }
     let context = context_for(&observations);
 
-    let summaries = analyze_observations(&observations, &context);
+    let summaries = analyze_observations(&observations, &context).unwrap();
 
     assert_ne!(
         summaries[0].recommendation, "continue",
@@ -180,7 +180,7 @@ fn detection_floor_sweep() {
                 row.future_return = corr * (row.mean_sentiment * 0.02) + (1.0 - corr) * n;
             }
             let context = context_for(&observations);
-            let s = &analyze_observations(&observations, &context)[0];
+            let s = &analyze_observations(&observations, &context).unwrap()[0];
             println!(
                 "  {n:<5} {corr:<15.2} {:<11} {:>13.5} {:>14.5}",
                 s.recommendation, s.sentiment_net_return, s.best_baseline_net_return

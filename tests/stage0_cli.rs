@@ -94,10 +94,17 @@ fn run_accepts_checked_in_stage0_config() {
 const FIXTURE_DATASET_ID: &str = "ds_f54fedeadaa2bd75";
 const FIXTURE_OBSERVATION_SET_ID: &str = "obs_51695fe1ee301377";
 
-/// The research loop's output must be unmoved by all of Stage 1's plumbing
-/// work. If the *verdicts* ever change, the refactor broke the science, not
-/// just the storage layout — and that is a different and much worse bug than a
-/// moved hash.
+/// The research loop's output must move only for a REASON. Plumbing must never
+/// touch the verdicts; a deliberate correctness fix may, and when it does the
+/// change belongs here, explained, rather than silently re-pinned.
+///
+/// The split from `decisions_revise=6` to `expand_sources=4 / revise=2` is one
+/// such fix. Analysis degeneracy is now judged on the DEVELOPMENT split, with the
+/// same quantiles the backtest uses. The backtest already treated four of the
+/// fixture's tiny configurations as degenerate (they took zero trades); analysis
+/// used whole-group quantiles and disagreed, reporting `revise` as if it had
+/// tested a signal the backtest never even traded. The two now agree: a
+/// configuration the backtest cannot trade reads `expand sources`, not `revise`.
 #[test]
 fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
     let temp = TempDir::new().unwrap();
@@ -121,7 +128,10 @@ fn stage_1_plumbing_leaves_the_fixtures_research_verdicts_untouched() {
     // One line per verdict value that actually occurred. `run_all` used to
     // print "revise" as `total - continue`, which folded stop/expand data/
     // expand sources into `revise` the moment the full vocabulary existed.
-    .stdout(predicate::str::contains("decisions_revise=6"));
+    // Four configurations are degenerate on the development split (matching the
+    // backtest); the remaining two are revised.
+    .stdout(predicate::str::contains("decisions_expand_sources=4"))
+    .stdout(predicate::str::contains("decisions_revise=2"));
 }
 
 /// Task 9: the leakage check and inspection tables run on every invocation, not
